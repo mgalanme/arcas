@@ -1,0 +1,32 @@
+# =============================================================================
+# ARCAS - config/flink/flink-conf.yaml
+# Flink cluster configuration with explicit memory bounds.
+# LESSON LEARNED: without explicit bounds Flink claims 70% of host RAM.
+# =============================================================================
+
+jobmanager.memory.process.size: 512m
+taskmanager.memory.process.size: 1024m
+taskmanager.numberOfTaskSlots: 2
+
+jobmanager.rpc.address: flink-jobmanager
+jobmanager.rpc.port: 6123
+rest.port: 8081
+rest.bind-port: 8081
+
+# State backend - filesystem (no RocksDB dependency)
+state.backend: filesystem
+state.checkpoints.dir: file:///flink/checkpoints
+state.savepoints.dir: file:///flink/savepoints
+execution.checkpointing.interval: 30s
+execution.checkpointing.mode: EXACTLY_ONCE
+
+# Parallelism
+parallelism.default: 2
+
+# Restart strategy
+restart-strategy: fixed-delay
+restart-strategy.fixed-delay.attempts: 3
+restart-strategy.fixed-delay.delay: 10s
+
+# Logging
+env.log.level: INFO

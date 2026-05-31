@@ -1,0 +1,49 @@
+# =============================================================================
+# ARCAS - config/tempo/tempo.yaml
+# Distributed tracing backend.
+# Receives traces from OTel Collector, stores locally.
+# Retention: 72 hours (development).
+# =============================================================================
+
+stream_over_http_enabled: true
+
+server:
+  http_listen_port: 3200
+  log_level: info
+
+distributor:
+  receivers:
+    otlp:
+      protocols:
+        grpc:
+          endpoint: 0.0.0.0:4317
+        http:
+          endpoint: 0.0.0.0:4318
+
+ingester:
+  max_block_duration: 5m
+
+compactor:
+  compaction:
+    block_retention: 72h     # 3 days for development
+
+storage:
+  trace:
+    backend: local
+    local:
+      path: /tmp/tempo/blocks
+    wal:
+      path: /tmp/tempo/wal
+
+metrics_generator:
+  registry:
+    external_labels:
+      source: tempo
+      project: arcas
+  storage:
+    path: /tmp/tempo/generator/wal
+
+overrides:
+  defaults:
+    metrics_generator:
+      processors: [service-graphs, span-metrics]

@@ -1,0 +1,37 @@
+# =============================================================================
+# ARCAS - config/prometheus/alertmanager.yaml
+# Routes alerts from Prometheus to notification channels.
+# For development: all alerts go to a log receiver (no external notifications).
+# Add email/Slack receivers when moving to a shared environment.
+# =============================================================================
+
+global:
+  resolve_timeout: 5m
+
+route:
+  group_by: [alertname, service]
+  group_wait:      30s
+  group_interval:  5m
+  repeat_interval: 12h
+  receiver: dev-log
+
+  routes:
+    # High severity: resource exhaustion - immediate
+    - match:
+        severity: critical
+      receiver: dev-log
+      group_wait: 10s
+      repeat_interval: 1h
+
+receivers:
+  - name: dev-log
+    # Development: alerts are visible in Alertmanager UI at http://localhost:9093
+    # and in Grafana. No external notifications in dev mode.
+    webhook_configs: []
+
+inhibit_rules:
+  - source_match:
+      severity: critical
+    target_match:
+      severity: warning
+    equal: [alertname, service]

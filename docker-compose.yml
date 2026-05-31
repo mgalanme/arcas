@@ -1,0 +1,888 @@
+# =============================================================================
+# ARCAS - Anti-Corruption & Accountability System
+# docker-compose.yml - COMPLETE FILE
+# =============================================================================
+#
+# PROFILES (start selectively to respect the 16 GB RAM envelope):
+#   storage      - postgres, neo4j, qdrant, minio, redis
+#   messaging    - kafka (KRaft), apicurio schema registry, redpanda-console
+#   streaming    - flink-jobmanager, flink-taskmanager, debezium
+#   ai           - ollama (load on demand - frees ~2 GB when stopped)
+#   governance   - infisical-db, infisical, solace-broker
+#   observability- otel-collector, prometheus, grafana, loki, promtail, tempo, alertmanager
+#   registry     - local Docker registry (always run during development)
+#
+# USAGE EXAMPLES:
+#   docker compose --profile storage up -d
+#   docker compose --profile storage --profile messaging up -d
+#   docker compose --profile storage --profile messaging --profile streaming up -d
+#   docker compose --profile storage --profile messaging --profile streaming \
+#                  --profile ai --profile governance --profile observability \
+#                  --profile registry up -d          # full demo stack
+#
+# LESSON LEARNED: Never start all profiles at once during development.
+# The storage + messaging profiles (~3.6 GB) cover 90% of development tasks.
+# =============================================================================
+
+name: arcas
+
+# ---------------------------------------------------------------------------
+# SHARED NETWORK
+# ---------------------------------------------------------------------------
+networks:
+  arcas-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16
+
+# ---------------------------------------------------------------------------
+# VOLUMES
+# ---------------------------------------------------------------------------
+volumes:
+  postgres_data:
+  neo4j_data:
+  neo4j_logs:
+  neo4j_plugins:
+  qdrant_data:
+  minio_data:
+  redis_data:
+  kafka_data:
+  flink_data:
+  ollama_models:
+  infisical_db_data:
+  infisical_data:
+  sam_data:
+  prometheus_data:
+  grafana_data:
+  loki_data:
+  tempo_data:
+  registry_data:
+  debezium_data:
+
+# ---------------------------------------------------------------------------
+# SERVICES
+# ---------------------------------------------------------------------------
+services:
+
+  # ==========================================================================
+  # PROFILE: storage
+  # ==========================================================================
+
+  # --------------------------------------------------------------------------
+  # PostgreSQL 16
+  # Roles: structured metadata, alert lifecycle, audit log (append-only),
+  #        pseudonymisation vault, LangGraph checkpointer, Alembic migrations
+  # --------------------------------------------------------------------------
+  postgres:
+    image: localhost:5000/postgres:16-alpine
+    # Fallback if local registry not yet populated:
+    # image: postgres:16-alpine
+    container_name: arcas-postgres
+    profiles: [storage]
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: arcas
+      POSTGRES_USER: arcas_app
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=en_GB.UTF-8"
+      # Prevent excessive shared memory consumption
+      POSTGRES_SHARED_BUFFERS: 128MB
+      POSTGRES_EFFECTIVE_CACHE_SIZE: 256MB
+      POSTGRES_WORK_MEM: 16MB
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./config/postgres/init.sql:/docker-entrypoint-initdb.d/01_init.sql:ro
+      - ./config/postgres/audit_trigger.sql:/docker-entrypoint-initdb.d/02_audit_trigger.sql:ro
+    ports:
+      - "5432:5432"
+    networks:
+      - arcas-net
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+          cpus: "1.0"
+        reservations:
+          memory: 256m
+          cpus: "0.25"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U arcas_app -d arcas"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  # --------------------------------------------------------------------------
+  # Neo4j 5 Community Edition + APOC
+  # Role: actor relationship graph, community detection, ontology schema
+  # CRITICAL: heap and pagecache are explicitly capped to prevent JVM bloat
+  # --------------------------------------------------------------------------
+  neo4j:
+    image: localhost:5000/neo4j:5.23-community
+    # Fallback: image: neo4j:5.23-community
+    container_name: arcas-neo4j
+    profiles: [storage]
+    restart: unless-stopped
+    environment:
+      NEO4J_AUTH: neo4j/${NEO4J_PASSWORD}
+      # APOC plugin - must be declared here for auto-install
+      NEO4J_PLUGINS: '["apoc"]'
+      NEO4JLABS_PLUGINS: '["apoc"]'
+      # CRITICAL memory caps - without these, Neo4j expands to fill all RAM
+      NEO4J_dbms_memory_heap_initial__size: 512m
+      NEO4J_dbms_memory_heap_max__size: 1024m
+      NEO4J_dbms_memory_pagecache_size: 256m
+      NEO4J_dbms_jvm_additional: "-XX:+UseG1GC -XX:+DisableExplicitGC"
+      # Allow APOC procedures
+      NEO4J_dbms_security_procedures_unrestricted: "apoc.*"
+      NEO4J_dbms_security_procedures_allowlist: "apoc.*"
+      # enhanced_schema=False equivalent - avoid schema inference overhead
+      NEO4J_dbms_cypher_lenient__create__relationship: "true"
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+      - neo4j_plugins:/plugins
+    ports:
+      - "7474:7474"   # HTTP browser
+      - "7687:7687"   # Bolt protocol
+    networks:
+      - arcas-net
+    deploy:
+      resources:
+        limits:
+          memory: 1536m
+          cpus: "2.0"
+        reservations:
+          memory: 768m
+          cpus: "0.5"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:7474 || exit 1"]
+      interval: 20s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  # --------------------------------------------------------------------------
+  # Qdrant
+  # Role: embedding storage, semantic search, RAG context retrieval,
+  #       narrative clustering and coordination detection
+  # --------------------------------------------------------------------------
+  qdrant:
+    image: localhost:5000/qdrant:latest
+    # Fallback: image: qdrant/qdrant:latest
+    container_name: arcas-qdrant
+    profiles: [storage]
+    restart: unless-stopped
+    volumes:
+      - qdrant_data:/qdrant/storage
+      - ./config/qdrant/config.yaml:/qdrant/config/production.yaml:ro
+    ports:
+      - "6333:6333"   # REST API
+      - "6334:6334"   # gRPC
+    networks:
+      - arcas-net
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+          cpus: "1.0"
+        reservations:
+          memory: 256m
+          cpus: "0.25"
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/localhost/6333 && echo -e 'GET /healthz HTTP/1.0\\r\\nHost: localhost\\r\\n\\r\\n' >&3 && grep -q passed <&3"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  # --------------------------------------------------------------------------
+  # MinIO
+  # Role: raw ingested data (90-day retention), pseudonymised full text,
+  #       Apache Iceberg data files, model artefacts, backups
+  # --------------------------------------------------------------------------
+  minio:
+    image: localhost:5000/minio:latest
+    # Fallback: image: minio/minio:latest
+    container_name: arcas-minio
+    profiles: [storage]
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY}
+      MINIO_BROWSER_REDIRECT_URL: http://localhost:9001
+    volumes:
+      - minio_data:/data
+    ports:
+      - "9000:9000"   # S3-compatible API
+      - "9001:9001"   # Web console
+    networks:
+      - arcas-net
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+          cpus: "1.0"
+        reservations:
+          memory: 128m
+          cpus: "0.25"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9000/minio/health/live || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  # --------------------------------------------------------------------------
+  # Redis 7
+  # Role: hot query cache, agent session state, rate-limit counters,
+  #       pub/sub for real-time dashboard updates
+  # --------------------------------------------------------------------------
+  redis:
+    image: localhost:5000/redis:7-alpine
+    # Fallback: image: redis:7-alpine
+    container_name: arcas-redis
+    profiles: [storage]
+    restart: unless-stopped
+    command: redis-server --maxmemory 200mb --maxmemory-policy allkeys-lru --save "" --appendonly no
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    networks:
+      - arcas-net
+    deploy:
+      resources:
+        limits:
+          memory: 256m
+          cpus: "0.5"
+        reservations:
+          memory: 64m
+          cpus: "0.1"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  # ==========================================================================
+  # PROFILE: messaging
+  # ==========================================================================
+
+  # --------------------------------------------------------------------------
+  # Apache Kafka 7.7 in KRaft mode (NO ZooKeeper)
+  # LESSON LEARNED: KRaft eliminates ZooKeeper, saving ~512 MB RAM.
+  # Heap is explicitly capped: -Xms512m -Xmx768m
+  # --------------------------------------------------------------------------
+  kafka:
+    image: localhost:5000/cp-kafka:7.7.0
+    # Fallback: image: confluentinc/cp-kafka:7.7.0
+    container_name: arcas-kafka
+    profiles: [messaging]
+    restart: unless-stopped
+    hostname: kafka
+    environment:
+      # KRaft configuration - no ZooKeeper
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093,EXTERNAL://0.0.0.0:9094
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,EXTERNAL://localhost:9094
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_LOG_RETENTION_HOURS: 168
+      KAFKA_LOG_RETENTION_BYTES: 1073741824   # 1 GB max log size
+      KAFKA_LOG_SEGMENT_BYTES: 104857600      # 100 MB segment size
+      # CRITICAL: explicit JVM heap cap
+      KAFKA_HEAP_OPTS: "-Xms512m -Xmx768m"
+      CLUSTER_ID: arcas-cluster-KRaft-001
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    ports:
+      - "9094:9094"   # External access from host
+    networks:
+      arcas-net:
+        aliases: [kafka]
+    deploy:
+      resources:
+        limits:
+          memory: 1024m
+          cpus: "2.0"
+        reservations:
+          memory: 512m
+          cpus: "0.5"
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-topics --bootstrap-server localhost:9092 --list > /dev/null 2>&1 || exit 1"]
+      interval: 20s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+
+  # --------------------------------------------------------------------------
+  # Apicurio Registry - Schema Registry (Avro / JSON Schema)
+  # --------------------------------------------------------------------------
+  apicurio:
+    image: localhost:5000/apicurio-registry-mem:2.6.0.Final
+    # Fallback: image: apicurio/apicurio-registry-mem:2.6.0.Final
+    container_name: arcas-apicurio
+    profiles: [messaging]
+    restart: unless-stopped
+    ports:
+      - "8081:8080"
+    networks:
+      - arcas-net
+    deploy:
+      resources:
+        limits:
+          memory: 256m
+          cpus: "0.5"
+        reservations:
+          memory: 128m
+          cpus: "0.1"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8080/health/ready || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  # --------------------------------------------------------------------------
+  # Redpanda Console - Kafka management UI
+  # --------------------------------------------------------------------------
+  redpanda-console:
+    image: localhost:5000/console:latest
+    # Fallback: image: redpandadata/console:latest
+    container_name: arcas-redpanda-console
+    profiles: [messaging]
+    restart: unless-stopped
+    environment:
+      CONFIG_FILEPATH: /etc/redpanda/config.yaml
+    volumes:
+      - ./config/kafka/redpanda-console-config.yaml:/etc/redpanda/config.yaml:ro
+    ports:
+      - "8082:8080"
+    networks:
+      - arcas-net
+    depends_on:
+      kafka:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 128m
+          cpus: "0.3"
+        reservations:
+          memory: 64m
+
+  # ==========================================================================
+  # PROFILE: streaming
+  # ==========================================================================
+
+  # --------------------------------------------------------------------------
+  # Apache Flink 1.19 - JobManager
+  # CRITICAL: memory is explicitly bounded via FLINK_PROPERTIES
+  # --------------------------------------------------------------------------
+  flink-jobmanager:
+    image: localhost:5000/flink:1.19-scala_2.12-java11
+    # Fallback: image: flink:1.19-scala_2.12-java11
+    container_name: arcas-flink-jm
+    profiles: [streaming]
+    restart: unless-stopped
+    command: jobmanager
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.memory.process.size: 512m
+        jobmanager.rpc.address: flink-jobmanager
+        rest.bind-port: 8081
+        state.backend: filesystem
+        state.checkpoints.dir: file:///flink/checkpoints
+        execution.checkpointing.interval: 30s
+    volumes:
+      - flink_data:/flink
+      - ./config/flink/flink-conf.yaml:/opt/flink/conf/flink-conf.yaml:ro
+    ports:
+      - "8083:8081"   # Flink Web UI (8083 to avoid conflict with Apicurio)
+    networks:
+      arcas-net:
+        aliases: [flink-jobmanager]
+    deploy:
+      resources:
+        limits:
+          memory: 640m
+          cpus: "1.0"
+        reservations:
+          memory: 512m
+          cpus: "0.25"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8081/overview || exit 1"]
+      interval: 20s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  # --------------------------------------------------------------------------
+  # Apache Flink 1.19 - TaskManager
+  # CRITICAL: process memory capped at 1 GB, 2 task slots
+  # --------------------------------------------------------------------------
+  flink-taskmanager:
+    image: localhost:5000/flink:1.19-scala_2.12-java11
+    # Fallback: image: flink:1.19-scala_2.12-java11
+    container_name: arcas-flink-tm
+    profiles: [streaming]
+    restart: unless-stopped
+    command: taskmanager
+    environment:
+      FLINK_PROPERTIES: |
+        taskmanager.memory.process.size: 1024m
+        taskmanager.numberOfTaskSlots: 2
+        jobmanager.rpc.address: flink-jobmanager
+        state.backend: filesystem
+        state.checkpoints.dir: file:///flink/checkpoints
+    volumes:
+      - flink_data:/flink
+    networks:
+      - arcas-net
+    depends_on:
+      flink-jobmanager:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 1152m
+          cpus: "2.0"
+        reservations:
+          memory: 1024m
+          cpus: "0.5"
+
+  # --------------------------------------------------------------------------
+  # Debezium Connect - Change Data Capture
+  # Role: CDC from PostgreSQL to Kafka -> Iceberg lakehouse
+  # --------------------------------------------------------------------------
+  debezium:
+    image: localhost:5000/debezium:2.7
+    # Fallback: image: debezium/connect:2.7.0.Final
+    container_name: arcas-debezium
+    profiles: [streaming]
+    restart: unless-stopped
+    environment:
+      BOOTSTRAP_SERVERS: kafka:9092
+      GROUP_ID: arcas-debezium-cdc
+      CONFIG_STORAGE_TOPIC: arcas.debezium.configs
+      OFFSET_STORAGE_TOPIC: arcas.debezium.offsets
+      STATUS_STORAGE_TOPIC: arcas.debezium.status
+      CONNECT_KEY_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      CONNECT_VALUE_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      CONNECT_KEY_CONVERTER_SCHEMAS_ENABLE: "false"
+      CONNECT_VALUE_CONVERTER_SCHEMAS_ENABLE: "false"
+      HEAP_OPTS: "-Xms256m -Xmx512m"
+    volumes:
+      - debezium_data:/kafka/data
+    ports:
+      - "8084:8083"   # Debezium REST API
+    networks:
+      - arcas-net
+    depends_on:
+      kafka:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 640m
+          cpus: "1.0"
+        reservations:
+          memory: 384m
+          cpus: "0.25"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8083/connectors || exit 1"]
+      interval: 20s
+      timeout: 10s
+      retries: 5
+      start_period: 40s
+
+  # ==========================================================================
+  # PROFILE: ai
+  # ==========================================================================
+
+  # --------------------------------------------------------------------------
+  # Ollama - Local LLM server (Llama 3.2 3B)
+  # LESSON LEARNED: Do NOT set restart: always here.
+  # Load on demand via 'docker compose --profile ai up -d ollama'
+  # Unload when not needed: 'docker compose --profile ai stop ollama'
+  # This frees ~2 GB RAM during heavy processing tasks.
+  # --------------------------------------------------------------------------
+  ollama:
+    image: localhost:5000/ollama:latest
+    # Fallback: image: ollama/ollama:latest
+    container_name: arcas-ollama
+    profiles: [ai]
+    restart: "no"   # Intentional: do not auto-restart
+    environment:
+      OLLAMA_MAX_LOADED_MODELS: "1"   # Only one model in memory at a time
+      OLLAMA_NUM_PARALLEL: "1"
+    volumes:
+      - ollama_models:/root/.ollama
+    ports:
+      - "11434:11434"
+    networks:
+      - arcas-net
+    deploy:
+      resources:
+        limits:
+          memory: 2048m
+          cpus: "4.0"
+        reservations:
+          memory: 1024m
+          cpus: "1.0"
+
+  # ==========================================================================
+  # PROFILE: governance
+  # ==========================================================================
+
+  # --------------------------------------------------------------------------
+  # Infisical - Self-hosted secrets vault
+  # Uses its own dedicated PostgreSQL instance (separate from app DB)
+  # --------------------------------------------------------------------------
+  infisical-db:
+    image: localhost:5000/postgres:14-alpine
+    # Fallback: image: postgres:14-alpine
+    container_name: arcas-infisical-db
+    profiles: [governance]
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: infisical
+      POSTGRES_USER: infisical
+      POSTGRES_PASSWORD: ${INFISICAL_DB_PASSWORD:-infisical_internal_pwd}
+    volumes:
+      - infisical_db_data:/var/lib/postgresql/data
+    networks:
+      - arcas-net
+    deploy:
+      resources:
+        limits:
+          memory: 256m
+          cpus: "0.5"
+        reservations:
+          memory: 128m
+
+  infisical:
+    image: localhost:5000/infisical:latest-postgres
+    # Fallback: image: infisical/infisical:latest-postgres
+    container_name: arcas-infisical
+    profiles: [governance]
+    restart: unless-stopped
+    depends_on:
+      - infisical-db
+    environment:
+      DB_CONNECTION_URI: "postgresql://infisical:${INFISICAL_DB_PASSWORD:-infisical_internal_pwd}@infisical-db/infisical"
+      ENCRYPTION_KEY: ${INFISICAL_ENCRYPTION_KEY}
+      AUTH_SECRET: ${INFISICAL_AUTH_SECRET}
+      SITE_URL: "http://localhost:8085"
+      TELEMETRY_ENABLED: "false"
+    volumes:
+      - infisical_data:/app/data
+    ports:
+      - "8085:8080"
+    networks:
+      - arcas-net
+    deploy:
+      resources:
+        limits:
+          memory: 384m
+          cpus: "0.5"
+        reservations:
+          memory: 256m
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8080/api/status || exit 1"]
+      interval: 20s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  # --------------------------------------------------------------------------
+  # Solace PubSub+ Standard - Agent Mesh governance event bus
+  # Role: all agent lifecycle events, HITL requests/decisions, audit events
+  # shm_size is required by Solace
+  # --------------------------------------------------------------------------
+  solace-broker:
+    image: localhost:5000/solace-pubsub-standard:latest
+    # Fallback: image: solace/solace-pubsub-standard:latest
+    container_name: arcas-solace
+    profiles: [governance]
+    restart: unless-stopped
+    hostname: arcas-sam-broker
+    shm_size: "1g"
+    ulimits:
+      core: 0
+      nofile: 2448
+    environment:
+      username_admin_globalaccesslevel: admin
+      username_admin_password: ${SAM_PASSWORD}
+      system_scaling_maxconnectioncount: "100"
+    volumes:
+      - sam_data:/var/lib/solace
+    ports:
+      - "8008:8008"     # Web transport (MQTT over WebSocket)
+      - "1883:1883"     # MQTT
+      - "5672:5672"     # AMQP
+      - "55555:55555"   # SMF (Solace Message Format)
+      - "8086:8080"     # SEMP management API (8086 to avoid conflicts)
+    networks:
+      arcas-net:
+        aliases: [sam-broker]
+    deploy:
+      resources:
+        limits:
+          memory: 1024m
+          cpus: "1.0"
+        reservations:
+          memory: 512m
+          cpus: "0.25"
+
+  # ==========================================================================
+  # PROFILE: observability
+  # ==========================================================================
+
+  # --------------------------------------------------------------------------
+  # OpenTelemetry Collector
+  # Central telemetry fanout: receives OTLP from all services,
+  # exports to Prometheus (metrics), Loki (logs), Tempo (traces)
+  # memory_limiter processor is CRITICAL to prevent OOM
+  # --------------------------------------------------------------------------
+  otel-collector:
+    image: localhost:5000/opentelemetry-collector-contrib:0.107.0
+    # Fallback: image: otel/opentelemetry-collector-contrib:0.107.0
+    container_name: arcas-otel-collector
+    profiles: [observability]
+    restart: unless-stopped
+    command: ["--config=/etc/otelcol/config.yaml"]
+    volumes:
+      - ./config/otel/otel-collector-config.yaml:/etc/otelcol/config.yaml:ro
+    ports:
+      - "4317:4317"   # OTLP gRPC receiver
+      - "4318:4318"   # OTLP HTTP receiver
+      - "13133:13133" # Health check
+      - "8888:8888"   # Internal metrics
+    networks:
+      - arcas-net
+    deploy:
+      resources:
+        limits:
+          memory: 256m
+          cpus: "0.5"
+        reservations:
+          memory: 128m
+          cpus: "0.1"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:13133 || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  # --------------------------------------------------------------------------
+  # Prometheus
+  # --------------------------------------------------------------------------
+  prometheus:
+    image: localhost:5000/prometheus:v2.54.0
+    # Fallback: image: prom/prometheus:v2.54.0
+    container_name: arcas-prometheus
+    profiles: [observability]
+    restart: unless-stopped
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=15d"
+      - "--storage.tsdb.retention.size=2GB"
+      - "--web.enable-remote-write-receiver"   # Required by OTel Collector
+    volumes:
+      - ./config/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "9090:9090"
+    networks:
+      - arcas-net
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+          cpus: "0.5"
+        reservations:
+          memory: 256m
+          cpus: "0.1"
+
+  # --------------------------------------------------------------------------
+  # Grafana
+  # --------------------------------------------------------------------------
+  grafana:
+    image: localhost:5000/grafana:11.2.0
+    # Fallback: image: grafana/grafana:11.2.0
+    container_name: arcas-grafana
+    profiles: [observability]
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      GF_SERVER_ROOT_URL: http://localhost:3000
+      GF_FEATURE_TOGGLES_ENABLE: traceqlEditor
+      GF_INSTALL_PLUGINS: ""
+    volumes:
+      - ./config/grafana/datasources.yaml:/etc/grafana/provisioning/datasources/datasources.yaml:ro
+      - ./config/grafana/dashboards.yaml:/etc/grafana/provisioning/dashboards/dashboards.yaml:ro
+      - ./config/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    ports:
+      - "3000:3000"
+    networks:
+      - arcas-net
+    depends_on:
+      - prometheus
+    deploy:
+      resources:
+        limits:
+          memory: 256m
+          cpus: "0.5"
+        reservations:
+          memory: 128m
+          cpus: "0.1"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:3000/api/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  # --------------------------------------------------------------------------
+  # Loki - Log aggregation
+  # --------------------------------------------------------------------------
+  loki:
+    image: localhost:5000/loki:3.1.0
+    # Fallback: image: grafana/loki:3.1.0
+    container_name: arcas-loki
+    profiles: [observability]
+    restart: unless-stopped
+    command: -config.file=/etc/loki/local-config.yaml
+    volumes:
+      - ./config/loki/loki-config.yaml:/etc/loki/local-config.yaml:ro
+      - loki_data:/loki
+    ports:
+      - "3100:3100"
+    networks:
+      - arcas-net
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+          cpus: "0.5"
+        reservations:
+          memory: 256m
+          cpus: "0.1"
+
+  # --------------------------------------------------------------------------
+  # Promtail - Log shipper (reads Docker container logs)
+  # --------------------------------------------------------------------------
+  promtail:
+    image: localhost:5000/promtail:3.1.0
+    # Fallback: image: grafana/promtail:3.1.0
+    container_name: arcas-promtail
+    profiles: [observability]
+    restart: unless-stopped
+    command: -config.file=/etc/promtail/config.yaml
+    volumes:
+      - ./config/loki/promtail-config.yaml:/etc/promtail/config.yaml:ro
+      - /var/log:/var/log:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+    networks:
+      - arcas-net
+    depends_on:
+      - loki
+    deploy:
+      resources:
+        limits:
+          memory: 128m
+          cpus: "0.25"
+        reservations:
+          memory: 64m
+
+  # --------------------------------------------------------------------------
+  # Tempo - Distributed tracing backend
+  # --------------------------------------------------------------------------
+  tempo:
+    image: localhost:5000/tempo:2.5.0
+    # Fallback: image: grafana/tempo:2.5.0
+    container_name: arcas-tempo
+    profiles: [observability]
+    restart: unless-stopped
+    command: ["-config.file=/etc/tempo/tempo.yaml"]
+    volumes:
+      - ./config/tempo/tempo.yaml:/etc/tempo/tempo.yaml:ro
+      - tempo_data:/tmp/tempo
+    ports:
+      - "3200:3200"   # Tempo API
+      - "4319:4317"   # OTLP gRPC (4319 to avoid conflict with OTel Collector)
+    networks:
+      - arcas-net
+    deploy:
+      resources:
+        limits:
+          memory: 256m
+          cpus: "0.5"
+        reservations:
+          memory: 128m
+          cpus: "0.1"
+
+  # --------------------------------------------------------------------------
+  # Alertmanager
+  # --------------------------------------------------------------------------
+  alertmanager:
+    image: localhost:5000/alertmanager:v0.27.0
+    # Fallback: image: prom/alertmanager:v0.27.0
+    container_name: arcas-alertmanager
+    profiles: [observability]
+    restart: unless-stopped
+    command:
+      - "--config.file=/etc/alertmanager/config.yaml"
+      - "--storage.path=/alertmanager"
+    volumes:
+      - ./config/prometheus/alertmanager.yaml:/etc/alertmanager/config.yaml:ro
+    ports:
+      - "9093:9093"
+    networks:
+      - arcas-net
+    deploy:
+      resources:
+        limits:
+          memory: 64m
+          cpus: "0.2"
+        reservations:
+          memory: 32m
+
+  # ==========================================================================
+  # PROFILE: registry
+  # Always run during development to avoid Docker Hub pull rate limits.
+  # ==========================================================================
+  registry:
+    image: registry:2
+    container_name: arcas-registry
+    profiles: [registry]
+    restart: unless-stopped
+    volumes:
+      - registry_data:/var/lib/registry
+    ports:
+      - "5000:5000"
+    networks:
+      - arcas-net
+    deploy:
+      resources:
+        limits:
+          memory: 128m
+          cpus: "0.2"
+        reservations:
+          memory: 64m
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:5000/v2/ || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5

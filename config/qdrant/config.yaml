@@ -1,0 +1,17 @@
+# =============================================================================
+# ARCAS - config/qdrant/config.yaml
+# Qdrant vector store configuration.
+# NOTE: health endpoint is /healthz (returns plain text "healthz check passed")
+# Use: curl -s http://localhost:6333/healthz | grep -q 'passed'
+# =============================================================================
+
+storage:
+  storage_path: /qdrant/storage
+
+service:
+  host: 0.0.0.0
+  http_port: 6333
+  grpc_port: 6334
+  max_request_size_mb: 32
+
+log_level: INFO

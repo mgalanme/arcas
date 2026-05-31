@@ -1,0 +1,16 @@
+# =============================================================================
+# ARCAS - config/grafana/dashboards.yaml
+# Tells Grafana where to find dashboard JSON files.
+# =============================================================================
+
+apiVersion: 1
+
+providers:
+  - name: arcas-dashboards
+    orgId: 1
+    folder: ARCAS
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    options:
+      path: /var/lib/grafana/dashboards

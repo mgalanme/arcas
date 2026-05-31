@@ -1,0 +1,22 @@
+# =============================================================================
+# ARCAS - config/kafka/redpanda-console-config.yaml
+# Redpanda Console (Kafka UI) configuration
+# Access at: http://localhost:8082
+# =============================================================================
+
+kafka:
+  brokers:
+    - kafka:9092
+  schemaRegistry:
+    enabled: true
+    urls:
+      - http://apicurio:8080/apis/ccompat/v6
+
+server:
+  listenPort: 8080
+
+connect:
+  enabled: true
+  clusters:
+    - name: arcas-debezium
+      url: http://debezium:8083

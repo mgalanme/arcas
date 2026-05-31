@@ -1,0 +1,27 @@
+{
+  "__inputs": [],
+  "__requires": [],
+  "annotations": { "list": [] },
+  "description": "ARCAS system overview - replace with real dashboard in Phase 1",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "id": null,
+  "panels": [
+    {
+      "gridPos": { "h": 4, "w": 24, "x": 0, "y": 0 },
+      "id": 1,
+      "options": {
+        "content": "# ARCAS - Anti-Corruption & Accountability System\n\nDashboard provisioning is working. Replace this file with your custom dashboards in `config/grafana/dashboards/`.",
+        "mode": "markdown"
+      },
+      "title": "ARCAS Status",
+      "type": "text"
+    }
+  ],
+  "schemaVersion": 39,
+  "tags": ["arcas"],
+  "title": "ARCAS Overview",
+  "uid": "arcas-overview",
+  "version": 1
+}
