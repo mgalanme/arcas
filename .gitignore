@@ -1,0 +1,42 @@
+ Environment and secrets - NEVER commit these
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+secrets/
+ 
+# Python
+__pycache__/
+*.py[cod]
+.venv*/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.coverage
+htmlcov/
+ 
+# Data and models - too large for git
+data/raw/
+data/processed/
+data/iceberg/
+*.bin
+*.pt
+*.safetensors
+ 
+# IDE
+.idea/
+.vscode/
+*.swp
+ 
+# k3s / Kubernetes
+kubeconfig
+*.kubeconfig
+ 
+# Node (for doc generation scripts)
+node_modules/
+ 
+# OS
+.DS_Store
+Thumbs.db
