@@ -1,0 +1,85 @@
+# =============================================================================
+# ARCAS - config/otel/otel-collector-config.yaml
+# OpenTelemetry Collector - central telemetry fanout.
+# Receives OTLP from all services; exports to Prometheus, Loki and Tempo.
+# memory_limiter processor is CRITICAL - prevents OOM on a resource-
+# constrained host.
+# =============================================================================
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: "0.0.0.0:4317"
+      http:
+        endpoint: "0.0.0.0:4318"
+  prometheus:
+    config:
+      scrape_configs:
+        - job_name: arcas-internal
+          scrape_interval: 15s
+          static_configs:
+            - targets:
+                - arcas-api:8000
+                - arcas-dashboard:8501
+
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 200
+    spike_limit_mib: 50
+  batch:
+    timeout: 1s
+    send_batch_size: 1024
+  resource:
+    attributes:
+      - key: service.namespace
+        value: arcas
+        action: upsert
+      - key: deployment.environment
+        value: development
+        action: upsert
+
+exporters:
+  prometheusremotewrite:
+    endpoint: "http://prometheus:9090/api/v1/write"
+    tls:
+      insecure: true
+  loki:
+    endpoint: "http://loki:3100/loki/api/v1/push"
+    default_labels_enabled:
+      exporter: true
+      job: true
+      instance: true
+      level: true
+  otlp/tempo:
+    endpoint: "tempo:4317"
+    tls:
+      insecure: true
+
+extensions:
+  health_check:
+    endpoint: "0.0.0.0:13133"
+  pprof:
+    endpoint: "0.0.0.0:1777"
+
+service:
+  extensions: [health_check, pprof]
+  pipelines:
+    traces:
+      receivers:  [otlp]
+      processors: [memory_limiter, batch, resource]
+      exporters:  [otlp/tempo]
+    metrics:
+      receivers:  [otlp, prometheus]
+      processors: [memory_limiter, batch, resource]
+      exporters:  [prometheusremotewrite]
+    logs:
+      receivers:  [otlp]
+      processors: [memory_limiter, batch, resource]
+      exporters:  [loki]
+  telemetry:
+    logs:
+      level: warn
+    metrics:
+      address: "0.0.0.0:8888"

@@ -1,0 +1,67 @@
+# =============================================================================
+# ARCAS - config/sam/docker-compose.sam.yml
+#
+# Solace PubSub+ Standard - Agent Mesh governance event bus.
+# Provides the governance backbone for all agent-to-agent communication,
+# HITL event routing and audit trail population.
+#
+# TOPIC SCHEME: arcas/{domain}/{action}/{entity}
+#   arcas/agent/lifecycle/started
+#   arcas/agent/task/assigned
+#   arcas/hitl/request/alert_review
+#   arcas/hitl/decision/approved
+#   arcas/alert/created/category_a
+#   arcas/governance/drift/fraud_agent
+#
+# FIRST-TIME SETUP:
+#   1. Start: docker compose -f config/sam/docker-compose.sam.yml up -d
+#   2. Wait ~30s then run: bash scripts/setup/init_sam_topics.sh
+#   3. Verify at: http://localhost:8086 (admin / ${SAM_PASSWORD})
+#
+# SUBSEQUENT STARTS: included in main docker-compose.yml --profile governance
+# =============================================================================
+
+name: arcas-sam
+
+networks:
+  arcas-net:
+    external: true
+
+volumes:
+  sam_data:
+    name: arcas_sam_data
+
+services:
+  solace-broker:
+    image: localhost:5000/solace-pubsub-standard:latest
+    container_name: arcas-solace
+    restart: unless-stopped
+    hostname: arcas-sam-broker
+    # shm_size is required by Solace - it uses shared memory for message spooling
+    shm_size: "1g"
+    ulimits:
+      core: 0
+      nofile: 2448
+    environment:
+      username_admin_globalaccesslevel: admin
+      username_admin_password: ${SAM_PASSWORD:-arcas_sam_pwd}
+      system_scaling_maxconnectioncount: "100"
+    volumes:
+      - sam_data:/var/lib/solace
+    ports:
+      - "8008:8008"     # Web transport (MQTT over WebSocket)
+      - "1883:1883"     # MQTT
+      - "5672:5672"     # AMQP
+      - "55555:55555"   # SMF (Solace Message Format) - used by Python SDK
+      - "8086:8080"     # SEMP v2 management REST API
+    networks:
+      arcas-net:
+        aliases: [sam-broker]
+    deploy:
+      resources:
+        limits:
+          memory: 1024m
+          cpus: "1.0"
+        reservations:
+          memory: 512m
+          cpus: "0.25"
