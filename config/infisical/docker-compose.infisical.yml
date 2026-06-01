@@ -66,6 +66,7 @@ services:
       AUTH_SECRET: ${INFISICAL_AUTH_SECRET}
       SITE_URL: "http://localhost:8085"
       TELEMETRY_ENABLED: "false"
+      REDIS_URL: "redis://arcas-redis:6379"
     volumes:
       - infisical_data:/app/data
     ports:
