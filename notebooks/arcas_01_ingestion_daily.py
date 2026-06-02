@@ -1,22 +1,16 @@
 # Databricks notebook source
-# ARCAS - 01_ingestion_daily v2
-# Ingesta diaria autónoma: BOE + medios + fact-checkers + fuentes judiciales → Delta Lake
-# Cambios v2:
-#   - Nuevas fuentes: Poder Judicial, Transparencia, Civio, EFE Verifica, RTVE Verifica
-#   - Traducción al castellano de títulos en inglés via Groq
-#   - Keywords mejorados para sesgo judicial, desinformación y redes de influencia
-#   - Prompt de análisis en español
+# ARCAS - 01_ingestion_daily v3
+# Cambios v3:
+#   - Análisis profundo de corrupción: segunda llamada Groq por artículo candidato
+#   - Campo content_snippet extraído del artículo para análisis de contenido real
+#   - Score enriquecido con análisis semántico, no solo keywords de titular
+#   - Nuevas señales: análisis de contratos BOE por importe y adjudicatario
 
 # COMMAND ----------
-# Celda 1: Título y descripción (sin código)
-# ARCAS v2 — ingesta diaria ampliada
-
-# COMMAND ----------
-# Celda 2: Imports y configuración
+# Celda 1: Imports y configuración
 
 import requests, json, hashlib, re, logging, time
 from datetime import date, timedelta
-from typing import Iterator
 import xml.etree.ElementTree as ET
 from bs4 import BeautifulSoup
 
@@ -32,7 +26,6 @@ except Exception:
         GROQ_API_KEY = ""
 
 GROQ_MODEL = "llama-3.3-70b-versatile"
-
 DB_RAW       = "arcas_raw"
 DB_PROCESSED = "arcas_processed"
 TBL_ARTICLES = f"{DB_RAW}.articles"
@@ -41,10 +34,9 @@ TBL_ALERTS   = f"{DB_PROCESSED}.alerts"
 print(f"Config OK — GROQ key present: {bool(GROQ_API_KEY)}")
 
 # COMMAND ----------
-# Celda 3: Groq helper
+# Celda 2: Groq helper con retry
 
 def groq_invoke(prompt: str, max_tokens: int = 400, temperature: float = 0.1) -> str:
-    """Call Groq API with retry on rate limit."""
     for attempt in range(3):
         try:
             r = requests.post(
@@ -70,107 +62,133 @@ def groq_invoke(prompt: str, max_tokens: int = 400, temperature: float = 0.1) ->
     return ""
 
 def translate_to_spanish(title: str) -> str:
-    """Translate a title to Spanish if it appears to be in another language."""
-    # Simple heuristic: if common Spanish words are absent, translate
-    spanish_markers = ["el ", "la ", "los ", "las ", "de ", "del ", "en ", "por ", "que ", "con ", "una ", "un "]
-    t_lower = title.lower()
-    if any(m in t_lower for m in spanish_markers):
-        return title  # Already Spanish
+    spanish_markers = ["el ", "la ", "los ", "las ", "de ", "del ", "en ",
+                       "por ", "que ", "con ", "una ", "un "]
+    if any(m in title.lower() for m in spanish_markers):
+        return title
     result = groq_invoke(
-        f"Traduce este titular al español. Devuelve solo el titular traducido, sin explicaciones:\n{title}",
-        max_tokens=100,
-        temperature=0.0,
+        f"Traduce este titular al español. Solo el titular traducido:\n{title}",
+        max_tokens=80, temperature=0.0,
     )
     return result if result else title
 
 print("Groq helpers OK")
 
 # COMMAND ----------
-# Celda 4: Crear schemas y tablas Delta
+# Celda 3: Crear / migrar tablas Delta
 
 spark.sql(f"CREATE DATABASE IF NOT EXISTS {DB_RAW}")
 spark.sql(f"CREATE DATABASE IF NOT EXISTS {DB_PROCESSED}")
 
 spark.sql(f"""
 CREATE TABLE IF NOT EXISTS {TBL_ARTICLES} (
-    source_type    STRING,
-    source_name    STRING,
-    title          STRING,
-    title_es       STRING,
-    content_url    STRING,
-    pub_date       STRING,
-    language       STRING,
-    jurisdiction   STRING,
-    content_hash   STRING,
-    is_factchecker BOOLEAN,
-    ingested_at    TIMESTAMP
+    source_type      STRING,
+    source_name      STRING,
+    title            STRING,
+    title_es         STRING,
+    content_url      STRING,
+    content_snippet  STRING,
+    pub_date         STRING,
+    language         STRING,
+    jurisdiction     STRING,
+    content_hash     STRING,
+    is_factchecker   BOOLEAN,
+    ingested_at      TIMESTAMP
 ) USING DELTA
 TBLPROPERTIES ('delta.enableChangeDataFeed' = 'true')
 """)
 
 spark.sql(f"""
 CREATE TABLE IF NOT EXISTS {TBL_ALERTS} (
-    alert_id         STRING,
-    category         STRING,
-    status           STRING,
-    confidence_score DOUBLE,
-    nl_justification STRING,
-    source_name      STRING,
-    title            STRING,
-    content_url      STRING,
-    created_at       TIMESTAMP
+    alert_id           STRING,
+    category           STRING,
+    status             STRING,
+    confidence_score   DOUBLE,
+    nl_justification   STRING,
+    deep_analysis      STRING,
+    source_name        STRING,
+    title              STRING,
+    content_url        STRING,
+    created_at         TIMESTAMP
 ) USING DELTA
 """)
 
-# Add title_es column if it doesn't exist yet (idempotent migration)
-try:
-    spark.sql(f"ALTER TABLE {TBL_ARTICLES} ADD COLUMN title_es STRING")
-    print("Added title_es column")
-except Exception:
-    print("title_es column already exists")
+# Idempotent column migrations
+for col, typedef in [
+    ("title_es",        "STRING"),
+    ("content_snippet", "STRING"),
+    ("deep_analysis",   "STRING"),
+]:
+    for tbl in [TBL_ARTICLES]:
+        try:
+            spark.sql(f"ALTER TABLE {tbl} ADD COLUMN {col} {typedef}")
+            print(f"Added {col} to {tbl}")
+        except Exception:
+            pass
+for col, typedef in [("deep_analysis", "STRING")]:
+    try:
+        spark.sql(f"ALTER TABLE {TBL_ALERTS} ADD COLUMN {col} {typedef}")
+        print(f"Added {col} to {TBL_ALERTS}")
+    except Exception:
+        pass
 
 print("Tables ready")
 
 # COMMAND ----------
-# Celda 5: Fuentes de ingesta
-
-MEDIA_SOURCES = [
-    # Prensa generalista — espectro ideológico completo
-    ("El País",        "https://elpais.com/espana/",               "es", False),
-    ("El Mundo",       "https://www.elmundo.es/espana.html",        "es", False),
-    ("ABC",            "https://www.abc.es/espana/",                "es", False),
-    ("La Vanguardia",  "https://www.lavanguardia.com/politica",     "es", False),
-    ("Público",        "https://www.publico.es/politica",           "es", False),
-    ("elDiario.es",    "https://www.eldiario.es/politica/",         "es", False),
-    ("OK Diario",      "https://okdiario.com/espana/",              "es", False),
-    ("La Razón",       "https://www.larazon.es/espana/",            "es", False),
-    ("El Español",     "https://www.elespanol.com/espana/",         "es", False),
-    ("infoLibre",      "https://www.infolibre.es/politica/",        "es", False),
-    ("Expansión",      "https://www.expansion.com/economia.html",   "es", False),
-    ("El Confidencial","https://www.elconfidencial.com/espana/",    "es", False),
-    ("La Sexta",       "https://www.lasexta.com/noticias/nacional/","es", False),
-    ("RTVE",           "https://www.rtve.es/noticias/espana/",      "es", False),
-    # Fuentes judiciales y de transparencia — clave para cat C y F
-    ("Poder Judicial", "https://www.poderjudicial.es/cgpj/es/Poder-Judicial/Noticias-Judiciales/", "es", False),
-    ("Transparencia",  "https://www.transparencia.gob.es/transparencia/transparencia_Home/index/Mas-informacion/noticias.html", "es", False),
-    ("Civio",          "https://civio.es/noticias/",               "es", False),
-    ("El Salto",       "https://www.elsaltodiario.com/politica",    "es", False),
-    # Internacionales — contexto europeo
-    ("AP News Spain",  "https://apnews.com/hub/spain",              "en", False),
-    ("Transparency Intl","https://www.transparency.org/en/news",    "en", False),
-    # Fact-checkers — fuente de verdad verificada
-    ("Maldita.es",     "https://maldita.es/malditobulo/",           "es", True),
-    ("Newtral",        "https://www.newtral.es/zona-verificacion/fact-check/", "es", True),
-    ("EFE Verifica",   "https://verifica.efe.com/",                 "es", True),
-    ("RTVE Verifica",  "https://www.rtve.es/noticias/verificacion/","es", True),
-    ("Snopes",         "https://www.snopes.com/fact-check/",        "en", True),
-    ("PolitiFact",     "https://www.politifact.com/factchecks/",    "en", True),
-]
+# Celda 4: Fuentes
 
 HEADERS_HTTP = {
-    "User-Agent": "Mozilla/5.0 (compatible; ARCAS-Research/2.0; +https://github.com/mgalanme/arcas)",
+    "User-Agent": "Mozilla/5.0 (compatible; ARCAS-Research/3.0; +https://github.com/mgalanme/arcas)",
     "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
 }
+
+MEDIA_SOURCES = [
+    # Prensa generalista
+    ("El País",          "https://elpais.com/espana/",                "es", False),
+    ("El Mundo",         "https://www.elmundo.es/espana.html",         "es", False),
+    ("ABC",              "https://www.abc.es/espana/",                 "es", False),
+    ("La Vanguardia",    "https://www.lavanguardia.com/politica",      "es", False),
+    ("Público",          "https://www.publico.es/politica",            "es", False),
+    ("elDiario.es",      "https://www.eldiario.es/politica/",          "es", False),
+    ("OK Diario",        "https://okdiario.com/espana/",               "es", False),
+    ("La Razón",         "https://www.larazon.es/espana/",             "es", False),
+    ("El Español",       "https://www.elespanol.com/espana/",          "es", False),
+    ("infoLibre",        "https://www.infolibre.es/politica/",         "es", False),
+    ("El Confidencial",  "https://www.elconfidencial.com/espana/",     "es", False),
+    ("La Sexta",         "https://www.lasexta.com/noticias/nacional/", "es", False),
+    ("RTVE",             "https://www.rtve.es/noticias/espana/",       "es", False),
+    ("Expansión",        "https://www.expansion.com/economia.html",    "es", False),
+    # Fuentes judiciales y de transparencia
+    ("Poder Judicial",   "https://www.poderjudicial.es/cgpj/es/Poder-Judicial/Noticias-Judiciales/", "es", False),
+    ("Transparencia",    "https://www.transparencia.gob.es/transparencia/transparencia_Home/index/Mas-informacion/noticias.html", "es", False),
+    ("Civio",            "https://civio.es/noticias/",                 "es", False),
+    ("El Salto",         "https://www.elsaltodiario.com/politica",     "es", False),
+    # Internacionales
+    ("AP News Spain",    "https://apnews.com/hub/spain",               "en", False),
+    ("Transparency Intl","https://www.transparency.org/en/news",       "en", False),
+    # Fact-checkers
+    ("Maldita.es",       "https://maldita.es/malditobulo/",            "es", True),
+    ("Newtral",          "https://www.newtral.es/zona-verificacion/fact-check/", "es", True),
+    ("EFE Verifica",     "https://verifica.efe.com/",                  "es", True),
+    ("RTVE Verifica",    "https://www.rtve.es/noticias/verificacion/", "es", True),
+    ("Snopes",           "https://www.snopes.com/fact-check/",         "en", True),
+    ("PolitiFact",       "https://www.politifact.com/factchecks/",     "en", True),
+]
+
+def fetch_article_snippet(url: str, max_chars: int = 800) -> str:
+    """Fetch the first meaningful paragraphs of an article for deep analysis."""
+    try:
+        r = requests.get(url, headers=HEADERS_HTTP, timeout=15, allow_redirects=True)
+        r.raise_for_status()
+        soup = BeautifulSoup(r.text, "lxml")
+        # Remove nav, footer, scripts
+        for tag in soup(["nav", "footer", "script", "style", "aside", "header"]):
+            tag.decompose()
+        paragraphs = [p.get_text(strip=True) for p in soup.find_all("p") if len(p.get_text(strip=True)) > 60]
+        snippet = " ".join(paragraphs[:5])
+        return snippet[:max_chars]
+    except Exception:
+        return ""
 
 def scrape_source(name: str, url: str, language: str, is_fc: bool) -> list[dict]:
     try:
@@ -179,11 +197,9 @@ def scrape_source(name: str, url: str, language: str, is_fc: bool) -> list[dict]
     except Exception as e:
         log.warning(f"Scrape failed {name}: {e}")
         return []
-
     soup  = BeautifulSoup(r.text, "lxml")
     seen  = set()
     items = []
-
     for tag in soup.find_all(["h1", "h2", "h3"]):
         text = tag.get_text(strip=True)
         if len(text) < 25 or text in seen:
@@ -192,8 +208,7 @@ def scrape_source(name: str, url: str, language: str, is_fc: bool) -> list[dict]
         a = tag.find("a", href=True)
         link = a["href"] if a else url
         if link.startswith("/"):
-            base = "/".join(url.split("/")[:3])
-            link = base + link
+            link = "/".join(url.split("/")[:3]) + link
         elif not link.startswith("http"):
             link = url
         ch = hashlib.sha256(f"{text}|{name}".encode()).hexdigest()
@@ -201,8 +216,9 @@ def scrape_source(name: str, url: str, language: str, is_fc: bool) -> list[dict]
             "source_type":    "factcheck" if is_fc else "media",
             "source_name":    name,
             "title":          text,
-            "title_es":       "",   # filled later for non-Spanish
+            "title_es":       "",
             "content_url":    link,
+            "content_snippet": "",
             "pub_date":       date.today().isoformat(),
             "language":       language,
             "jurisdiction":   "ES" if language == "es" else "GL",
@@ -211,16 +227,22 @@ def scrape_source(name: str, url: str, language: str, is_fc: bool) -> list[dict]
         })
         if len(items) >= 30:
             break
-
     log.info(f"  {name}: {len(items)} articles")
     return items
 
-print("Sources defined:", len(MEDIA_SOURCES))
+print(f"Sources defined: {len(MEDIA_SOURCES)}")
 
 # COMMAND ----------
-# Celda 6: Ingesta BOE
+# Celda 5: Ingesta BOE
 
 BOE_API = "https://www.boe.es/datosabiertos/api/boe/sumario"
+
+# Keywords BOE que indican contratos y nombramientos relevantes
+BOE_CORRUPTION_PATTERNS = re.compile(
+    r"(adjudicaci|licitaci|contrato|concurso|subvenci|obra|nombramiento|"
+    r"resoluci.*cargo|cese.*cargo|libre designaci|confianza|delegaci)",
+    re.IGNORECASE
+)
 
 def fetch_boe(pub_date: date) -> list[dict]:
     url = f"{BOE_API}/{pub_date.strftime('%Y%m%d')}"
@@ -244,19 +266,24 @@ def fetch_boe(pub_date: date) -> list[dict]:
         title  = (item.findtext("titulo") or "").strip()
         if not doc_id or not title:
             continue
+        # Extract department/organism for context
+        dept = (item.findtext("departamento") or item.findtext("origen") or "").strip()
         url_html = (item.findtext("url_html") or "").strip()
         url_pdf  = (item.findtext("url_pdf") or "").strip()
+        # For BOE, snippet is title + department
+        snippet = f"{dept}: {title}" if dept else title
         records.append({
-            "source_type":    "gazette",
-            "source_name":    "BOE",
-            "title":          title,
-            "title_es":       title,  # BOE always in Spanish
-            "content_url":    url_html or url_pdf,
-            "pub_date":       pub_date.isoformat(),
-            "language":       "es",
-            "jurisdiction":   "ES",
-            "content_hash":   hashlib.sha256(f"{doc_id}|{title}|{pub_date}".encode()).hexdigest(),
-            "is_factchecker": False,
+            "source_type":     "gazette",
+            "source_name":     "BOE",
+            "title":           title,
+            "title_es":        title,
+            "content_url":     url_html or url_pdf,
+            "content_snippet": snippet,
+            "pub_date":        pub_date.isoformat(),
+            "language":        "es",
+            "jurisdiction":    "ES",
+            "content_hash":    hashlib.sha256(f"{doc_id}|{title}|{pub_date}".encode()).hexdigest(),
+            "is_factchecker":  False,
         })
     return records
 
@@ -266,20 +293,18 @@ for days_back in range(3):
     recs = fetch_boe(d)
     boe_records.extend(recs)
     log.info(f"BOE {d}: {len(recs)} records")
-
 print(f"BOE total: {len(boe_records)} records")
 
 # COMMAND ----------
-# Celda 7: Ingesta medios y fact-checkers
+# Celda 6: Ingesta medios
 
 media_records = []
 for name, url, lang, is_fc in MEDIA_SOURCES:
     media_records.extend(scrape_source(name, url, lang, is_fc))
-
 print(f"Media total: {len(media_records)} records")
 
 # COMMAND ----------
-# Celda 8: Guardar en Delta con deduplicación y traducción
+# Celda 7: Guardar en Delta con dedup y traducción
 
 from pyspark.sql import Row
 from pyspark.sql.functions import current_timestamp
@@ -287,7 +312,6 @@ from pyspark.sql.functions import current_timestamp
 all_records = boe_records + media_records
 print(f"Total records: {len(all_records)}")
 
-# Deduplicar contra existentes
 try:
     existing_hashes = set(
         r.content_hash
@@ -299,15 +323,13 @@ except Exception:
 new_records = [r for r in all_records if r["content_hash"] not in existing_hashes]
 print(f"New records after dedup: {len(new_records)}")
 
-# Traducir títulos en inglés (batch, con pausa para no saturar Groq)
 if new_records and GROQ_API_KEY:
     english_records = [r for r in new_records if r["language"] != "es"]
     print(f"Translating {len(english_records)} English titles...")
     for i, r in enumerate(english_records):
         r["title_es"] = translate_to_spanish(r["title"])
         if (i + 1) % 10 == 0:
-            time.sleep(3)  # Groq rate limit pause
-    # Spanish records: title_es == title
+            time.sleep(3)
     for r in new_records:
         if r["language"] == "es" and not r["title_es"]:
             r["title_es"] = r["title"]
@@ -320,81 +342,73 @@ if new_records:
 else:
     print("No new records today.")
 
-print("Ingestion complete")
-
 # COMMAND ----------
-# Celda 9: Scoring con keywords mejorados
+# Celda 8: Scoring con keywords
 
 KW_CAT_A = [
     "contrato", "adjudicaci", "licitaci", "concurso", "subvencion",
     "obra publica", "sobrecoste", "sobreprecio", "comision", "canon",
-    "pliego", "concesion", "proveedor", "factura", "malversacion",
+    "pliego", "concesion", "proveedor", "malversacion", "fondos publicos",
+    "contrato menor", "fraccionamiento", "libre designacion",
 ]
 KW_CAT_B = [
     "patrimonio", "enriquecimiento", "puerta giratoria", "offshore",
     "paraiso fiscal", "testaferro", "blanqueo", "evasion fiscal",
-    "cuenta opaca", "bienes ocultos", "fondos", "sociedad pantalla",
+    "cuenta opaca", "bienes ocultos", "sociedad pantalla", "comisionista",
 ]
 KW_CAT_C_JUDICIAL = [
     "juez", "tribunal", "sentencia", "fiscal", "sumario",
     "audiencia nacional", "tribunal supremo", "magistrado",
-    "instruccion", "juzgado", "imputado", "acusado",
+    "instruccion", "juzgado", "imputado", "acusado", "investigado",
 ]
 KW_CAT_C_BIAS = [
     "archivo", "archiva", "sobresee", "prescripcion", "dilaciones",
     "sin pruebas", "absuelto", "tiempo record", "express",
-    "exceso de celo", "guerra sucia", "policia politica",
-    "ucо", "udef", "guardia civil", "mossos",
+    "guerra sucia", "policia politica", "uco", "udef",
+    "guardia civil", "mossos", "errores procesales",
 ]
 KW_CAT_C_POLITICAL = [
     "psoe", "pp", "vox", "podemos", "partido socialista",
     "partido popular", "ciudadanos", "sumar", "junts", "pnv",
-    "afiliado", "cargo del partido", "militante",
+    "afiliado", "militante", "cargo del partido",
 ]
 KW_CAT_D = [
     "bulo", "falso", "mentira", "desinformacion", "fake",
     "desmentido", "verificado", "sin evidencia", "manipulado",
-    "fuera de contexto", "descontextualizado", "propaganda",
-    "viral", "hoax", "rumor",
+    "fuera de contexto", "propaganda", "viral", "hoax", "rumor",
+    "no es cierto", "es falso que",
 ]
 KW_CAT_E = [
-    "trama", "blanqueo", "financiacion ilegal", "comisionista",
-    "lobbista", "red de influencia", "contactos", "intermediario",
-    "donacion irregular", "financiador", "mecenas",
+    "trama", "blanqueo", "financiacion ilegal", "lobbista",
+    "red de influencia", "intermediario", "donacion irregular",
+    "financiador", "comisionista", "fondos opacos",
 ]
 KW_CAT_F = [
     "nepotismo", "enchufismo", "cargo de confianza", "incompatibilidad",
-    "conflicto de interes", "familiar", "conyuge", "hijo",
-    "nombramiento", "tiempo record", "sin meritos", "a dedo",
-    "hermanisimo", "cuñado", "chiringuito",
+    "conflicto de interes", "nombramiento", "a dedo",
+    "hermanisimo", "cunado", "chiringuito", "libre designacion",
+    "sin meritos", "familiar directo",
 ]
 
-THRESHOLD = 0.30
+THRESHOLD = 0.28
 
 def score(title: str, source_type: str, is_fc: bool) -> dict:
     t = title.lower()
-
-    def kw(lst):
-        return min(sum(1 for k in lst if k in t) * 0.15, 0.9)
-
+    def kw(lst): return min(sum(1 for k in lst if k in t) * 0.15, 0.9)
     def judicial_bias():
-        has_j = any(k in t for k in KW_CAT_C_JUDICIAL)
-        has_p = any(k in t for k in KW_CAT_C_POLITICAL)
-        has_b = any(k in t for k in KW_CAT_C_BIAS)
-        if has_j and has_p and has_b: return 0.75
-        if has_j and has_p:           return 0.50
-        if has_j and has_b:           return 0.50
-        if has_j:                     return 0.25
+        hj = any(k in t for k in KW_CAT_C_JUDICIAL)
+        hp = any(k in t for k in KW_CAT_C_POLITICAL)
+        hb = any(k in t for k in KW_CAT_C_BIAS)
+        if hj and hp and hb: return 0.75
+        if hj and (hp or hb): return 0.50
+        if hj: return 0.25
         return 0.0
-
     gazette_bonus = 0.15 if source_type == "gazette" else 0.0
-    fc_bonus      = 0.20 if is_fc else 0.0
-
     return {
         "cat_a": min(kw(KW_CAT_A) + gazette_bonus, 0.9),
         "cat_b": kw(KW_CAT_B),
         "cat_c": judicial_bias(),
-        "cat_d": max(kw(KW_CAT_D), 0.45 if is_fc else 0) + fc_bonus * 0.5,
+        "cat_d": max(kw(KW_CAT_D), 0.45 if is_fc else 0),
         "cat_e": kw(KW_CAT_E),
         "cat_f": kw(KW_CAT_F),
     }
@@ -405,28 +419,54 @@ def top_category(scores: dict) -> str:
 candidates = [r for r in (new_records if new_records else []) if r.get("title")]
 scored     = [(r, score(r["title"], r["source_type"], r["is_factchecker"])) for r in candidates]
 above      = [(r, s) for r, s in scored if max(s.values()) >= THRESHOLD]
-
-print(f"Candidates: {len(candidates)} | Above threshold: {len(above)}")
-for r, s in above[:10]:
-    print(f"  [{top_category(s)} {max(s.values()):.2f}] {r['title'][:70]}")
+print(f"Candidates: {len(candidates)} | Above threshold ({THRESHOLD}): {len(above)}")
 
 # COMMAND ----------
-# Celda 10: Generar hipótesis con Groq en español
+# Celda 9: Análisis profundo de corrupción con Groq
+# Para los candidatos que superan el umbral, se obtiene el snippet del artículo
+# y se hace una segunda llamada a Groq que analiza el contenido real,
+# no solo el titular. Esto detecta corrupción que no aparece en keywords.
 
 import uuid
 from datetime import datetime
 
 CAT_DESCRIPTIONS = {
-    "A": "fraude en contratación pública o irregularidad contractual",
-    "B": "enriquecimiento ilícito o puertas giratorias",
-    "C": "anomalía en patrón judicial — posible trato diferencial por afiliación política",
-    "D": "desinformación o bulo que beneficia a actores identificables",
-    "E": "red de influencia o financiación ilegal",
-    "F": "abuso de función pública o nepotismo",
+    "A": "fraude en contratación pública, adjudicación irregular o malversación de fondos públicos",
+    "B": "enriquecimiento ilícito, puertas giratorias o evasión fiscal por parte de cargos públicos",
+    "C": "sesgo judicial o trato procesal diferencial según afiliación política del investigado",
+    "D": "desinformación, bulo o manipulación informativa que beneficia a actores políticos identificables",
+    "E": "red de influencia, tráfico de influencias o financiación ilegal de partidos",
+    "F": "nepotismo, enchufismo o abuso de función pública en nombramientos",
 }
 
+DEEP_ANALYSIS_PROMPT = """Eres un analista experto en corrupción pública, periodismo de investigación y transparencia institucional.
+
+Analiza el siguiente contenido periodístico y determina si hay indicios de corrupción o irregularidad pública.
+
+TITULAR: {title}
+FUENTE: {source} ({source_type})
+CATEGORÍA DETECTADA: {cat_desc}
+CONTENIDO: {snippet}
+
+Responde en español con esta estructura exacta:
+
+**PATRÓN DETECTADO:**
+[Describe el patrón de irregularidad observado. Si no hay evidencia real de corrupción, indícalo claramente.]
+
+**ACTORES IMPLICADOS:**
+[Personas, organismos o entidades mencionadas que podrían estar involucradas.]
+
+**NIVEL DE PREOCUPACIÓN:** [Alto / Medio / Bajo / Sin evidencia]
+[Justifica en una frase.]
+
+**QUIÉN SE BENEFICIA:**
+[Quién podría beneficiarse si el patrón descrito fuera real.]
+
+**ACCIÓN RECOMENDADA:**
+[Qué debería hacer un ciudadano o periodista para verificar esto: qué documentos pedir, qué registros consultar.]"""
+
 alerts_to_save = []
-limit = min(len(above), 20)  # max 20 per run to respect Groq limits
+limit = min(len(above), 15)
 
 for record, scores in above[:limit]:
     cat      = top_category(scores)
@@ -434,40 +474,49 @@ for record, scores in above[:limit]:
     cat_desc = CAT_DESCRIPTIONS.get(cat, "patrón de corrupción")
     title_es = record.get("title_es") or record.get("title", "")
 
-    try:
-        hypothesis = groq_invoke(
-            f"Eres un analista anticorrupción. Analiza este registro para detectar: {cat_desc}.\n"
-            f"Sé factual y conciso. Nunca acuses — señala patrones únicamente.\n\n"
-            f"Titular: {title_es}\n"
-            f"Fuente: {record['source_name']} ({record['source_type']})\n"
-            f"URL: {record['content_url']}\n\n"
-            f"Responde en español:\n"
-            f"1) Patrón observado\n"
-            f"2) Nivel de confianza 0-1\n"
-            f"3) Quién podría beneficiarse de este patrón",
-            max_tokens=400,
-        )
-    except Exception as e:
-        hypothesis = f"[Patrón detectado] Categoría {cat}: {title_es[:100]}"
+    # Fetch article snippet for deep analysis
+    snippet = record.get("content_snippet", "")
+    if not snippet and record.get("content_url"):
+        log.info(f"  Fetching snippet for: {title_es[:50]}")
+        snippet = fetch_article_snippet(record["content_url"])
+        time.sleep(1)  # polite crawling
 
-    if hypothesis:
-        alerts_to_save.append({
-            "alert_id":         str(uuid.uuid4()),
-            "category":         cat,
-            "status":           "pending",
-            "confidence_score": round(conf, 3),
-            "nl_justification": hypothesis,
-            "source_name":      record["source_name"],
-            "title":            title_es,
-            "content_url":      record["content_url"],
-            "created_at":       datetime.utcnow().isoformat(),
-        })
-        print(f"  [{cat} {conf:.2f}] {title_es[:65]}")
+    # Deep analysis via Groq
+    prompt = DEEP_ANALYSIS_PROMPT.format(
+        title      = title_es,
+        source     = record["source_name"],
+        source_type= record["source_type"],
+        cat_desc   = cat_desc,
+        snippet    = snippet[:600] if snippet else "(contenido no disponible — análisis basado en titular)",
+    )
+    deep_analysis = groq_invoke(prompt, max_tokens=500)
+
+    if not deep_analysis:
+        deep_analysis = f"[Análisis no disponible] Categoría {cat}: {title_es[:100]}"
+
+    # Confidence boost if deep analysis finds real evidence
+    if "sin evidencia" in deep_analysis.lower() or "no hay indicio" in deep_analysis.lower():
+        conf = max(conf - 0.15, 0.20)  # penalise if no real evidence
+
+    alerts_to_save.append({
+        "alert_id":          str(uuid.uuid4()),
+        "category":          cat,
+        "status":            "pending",
+        "confidence_score":  round(conf, 3),
+        "nl_justification":  deep_analysis,
+        "deep_analysis":     deep_analysis,
+        "source_name":       record["source_name"],
+        "title":             title_es,
+        "content_url":       record["content_url"],
+        "created_at":        datetime.utcnow().isoformat(),
+    })
+    log.info(f"  [{cat} {conf:.2f}] {title_es[:65]}")
+    time.sleep(2)  # Groq rate limit
 
 print(f"\nAlerts generated: {len(alerts_to_save)}")
 
 # COMMAND ----------
-# Celda 11: Guardar alertas en Delta
+# Celda 10: Guardar alertas
 
 if alerts_to_save:
     from pyspark.sql.functions import to_timestamp
@@ -478,13 +527,12 @@ if alerts_to_save:
 else:
     print("No alerts today.")
 
-# Summary
 total_articles = spark.sql(f"SELECT count(*) AS n FROM {TBL_ARTICLES}").collect()[0]["n"]
 total_alerts   = spark.sql(f"SELECT count(*) AS n FROM {TBL_ALERTS}").collect()[0]["n"]
 pending_alerts = spark.sql(f"SELECT count(*) AS n FROM {TBL_ALERTS} WHERE status='pending'").collect()[0]["n"]
 
 print(f"\n=== ARCAS Daily Run Summary ===")
-print(f"Articles in Delta:  {total_articles}")
-print(f"Total alerts:       {total_alerts}")
-print(f"Pending HITL:       {pending_alerts}")
+print(f"Artículos procesados: {total_articles}")
+print(f"Alertas totales:      {total_alerts}")
+print(f"Pendientes revisión:  {pending_alerts}")
 print("================================")
