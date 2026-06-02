@@ -307,7 +307,7 @@ if page == "📊 Dashboard":
 
     df_alerts = run_query("""
         SELECT alert_id, category, status, confidence_score,
-               source_name, title, created_at
+               source_name, title, coalesce(title, title) AS title_es, created_at
         FROM arcas_processed.alerts
         ORDER BY created_at DESC
     """)
@@ -476,24 +476,30 @@ elif page == "✍️ Generador de Posts":
         st.info("No hay alertas disponibles para generar posts.")
     else:
         col_sel, col_lang = st.columns([2, 1])
-
         with col_sel:
             options = {
-                f"[{row['category']}] {str(row['title'])[:60]}…": row
+                f"[{row['category']}] {str(row['title'])[:65]}…": row
                 for _, row in df.iterrows()
             }
             selected_label = st.selectbox("Seleccionar alerta", list(options.keys()))
             selected = options[selected_label]
-
         with col_lang:
             lang_label = st.selectbox("Idioma del post", list(LANGUAGES.keys()))
             lang_name  = LANGUAGES[lang_label]
 
-        platform = st.radio(
-            "Red social",
-            ["Facebook / LinkedIn", "X (Twitter)", "Instagram"],
-            horizontal=True,
-        )
+        col_plat, col_tone = st.columns(2)
+        with col_plat:
+            platform = st.radio(
+                "Red social",
+                ["Facebook / LinkedIn", "X (Twitter)", "Instagram"],
+                horizontal=True,
+            )
+        with col_tone:
+            tone = st.select_slider(
+                "Tono",
+                options=["Informativo", "Analítico", "Urgente", "Pedagógico"],
+                value="Informativo",
+            )
 
         char_limits = {
             "Facebook / LinkedIn": 3000,
@@ -502,13 +508,23 @@ elif page == "✍️ Generador de Posts":
         }
         char_limit = char_limits[platform]
 
-        tone = st.select_slider(
-            "Tono del post",
-            options=["Informativo", "Analítico", "Urgente", "Pedagógico"],
-            value="Informativo",
+        st.markdown('<div class="section-title" style="margin-top:1.5rem;">Prompt maestro — instrucciones al modelo</div>', unsafe_allow_html=True)
+
+        DEFAULT_MASTER_PROMPT = """Eres un periodista de investigación riguroso y políticamente neutral.
+Tu misión es informar al público sobre patrones que merecen atención cívica.
+Nunca acuses directamente a personas ni partidos.
+Usa un lenguaje accesible, sin jerga técnica ni legal.
+Incluye siempre una llamada a la reflexión ciudadana al final del post."""
+
+        master_prompt = st.text_area(
+            "prompt_maestro",
+            value=DEFAULT_MASTER_PROMPT,
+            height=140,
+            label_visibility="collapsed",
+            placeholder="Escribe aquí tus instrucciones maestras para la generación del post...",
         )
 
-        if st.button("🖊️ Generar post", use_container_width=True):
+        if st.button("🖊️ Generar post en Markdown", use_container_width=True):
             cat      = selected["category"]
             cat_name = CAT_INFO.get(cat, (cat, "#556677"))[0]
             justif   = selected["nl_justification"]
@@ -516,44 +532,56 @@ elif page == "✍️ Generador de Posts":
             source   = selected["source_name"]
             conf     = float(selected["confidence_score"])
 
-            prompt = f"""Eres un periodista de investigación escribiendo un post de redes sociales de tono {tone.lower()} en {lang_name}.
+            full_prompt = f"""INSTRUCCIONES DEL OPERADOR:
+{master_prompt}
 
-El post es para {platform} y debe tener menos de {char_limit} caracteres.
-
-Contexto:
-- Patrón detectado: {cat_name} (Categoría {cat})
+---
+DATOS DE LA ALERTA:
+- Patrón: {cat_name} (Categoría {cat})
 - Fuente: {source}
 - Titular: {title}
-- Análisis: {justif[:400]}
-- Nivel de confianza: {conf:.0%}
+- Análisis: {justif[:500]}
+- Confianza: {conf:.0%}
 
-Requisitos:
-- Escribe íntegramente en {lang_name}
-- Sé factual, políticamente neutral, nunca acuses — solo señala patrones
-- Incluye hashtags relevantes al final
-- NO menciones IA, algoritmos ni el sistema ARCAS
+---
+REQUISITOS:
+- Idioma: {lang_name}
+- Plataforma: {platform} (máximo {char_limit} caracteres)
 - Tono: {tone}
-- Máximo {char_limit} caracteres
+- Formato de salida: Markdown (usa **negrita**, *cursiva*, emojis y #hashtags)
+- NO menciones IA, algoritmos ni sistemas automatizados
+- Factual y neutral — señala patrones, nunca acuses
 
-Escribe únicamente el texto del post, nada más."""
+Escribe únicamente el texto del post en Markdown."""
 
             with st.spinner("Generando post..."):
-                post_text = groq_generate(prompt)
+                post_md = groq_generate(full_prompt)
 
-            st.markdown("**Post generado:**")
-            st.markdown(f'<div class="post-output">{post_text}</div>', unsafe_allow_html=True)
+            st.markdown("**Texto Markdown (raw):**")
+            st.markdown(f'<div class="post-output">{post_md}</div>', unsafe_allow_html=True)
 
-            char_count = len(post_text)
+            st.markdown("**Renderizado:**")
+            st.markdown(post_md)
+
+            char_count = len(post_md)
             color = "#2a9d8f" if char_count <= char_limit else "#e63946"
             st.markdown(
-                f'<div class="alert-meta" style="margin-top:0.5rem; color:{color};">'
-                f'{char_count} / {char_limit} caracteres</div>',
-                unsafe_allow_html=True
+                f'<div class="alert-meta" style="margin-top:0.5rem; color:{color};">{char_count} / {char_limit} caracteres</div>',
+                unsafe_allow_html=True,
             )
 
-            st.download_button(
-                "⬇️ Descargar post",
-                post_text,
-                file_name=f"arcas_post_{lang_name.lower()}_{cat}.txt",
-                mime="text/plain",
-            )
+            col_dl1, col_dl2 = st.columns(2)
+            with col_dl1:
+                st.download_button(
+                    "⬇️ Descargar .md",
+                    post_md,
+                    file_name=f"arcas_post_{lang_name.lower()}_{cat}.md",
+                    mime="text/markdown",
+                )
+            with col_dl2:
+                st.download_button(
+                    "⬇️ Descargar .txt",
+                    post_md,
+                    file_name=f"arcas_post_{lang_name.lower()}_{cat}.txt",
+                    mime="text/plain",
+                )
