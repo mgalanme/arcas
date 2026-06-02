@@ -5,14 +5,6 @@
 
 # COMMAND ----------
 
-# Celda 1: Dependencias
-# En Job: estas librerías se instalan via init script o cluster libraries
-# En notebook interactivo: ejecutar esta celda una sola vez
-
-%pip install beautifulsoup4 lxml
-
-# COMMAND ----------
-
 # Celda 2: Imports y configuración
 
 import requests, json, hashlib, re, logging
@@ -25,7 +17,14 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 log = logging.getLogger(__name__)
 
 # Credenciales - en Job usar Databricks Secrets o env vars del cluster
-GROQ_API_KEY = dbutils.secrets.get(scope="arcas", key="groq_api_key") if dbutils.secrets.listScopes() else "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"
+try:
+    GROQ_API_KEY = dbutils.secrets.get(scope="arcas", key="groq_api_key")
+except Exception:
+    try:
+        GROQ_API_KEY = dbutils.widgets.get("GROQ_API_KEY")
+    except Exception:
+        GROQ_API_KEY = ""
+    
 GROQ_MODEL   = "llama-3.3-70b-versatile"
 
 # Delta tables
