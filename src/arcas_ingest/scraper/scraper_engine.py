@@ -69,6 +69,10 @@ MEDIA_TARGETS = [
     ScraperTarget("Naiz",               "https://www.naiz.eus/eu/actualidad/",      language="eu"),
     ScraperTarget("AP News Spain",      "https://apnews.com/hub/spain",
                   language="en", jurisdiction="GL"),
+    ScraperTarget("El Confidencial Legal", "https://www.elconfidencialegal.com/",  use_js=True),
+    ScraperTarget("Confilegal",            "https://confilegal.com/",               use_js=False),
+    ScraperTarget("Infojus Noticias",      "https://www.infojus.es/",               use_js=False),
+    ScraperTarget("Diario Jurídico",       "https://www.diariojuridico.com/",       use_js=False),
     ScraperTarget("Transparency Int.",  "https://www.transparency.org/en/news",
                   language="en", jurisdiction="GL"),
 ]

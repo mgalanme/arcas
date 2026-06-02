@@ -1,15 +1,10 @@
 """
-ARCAS - src/arcas_agents/orchestrator/detection_flow.py
+ARCAS - src/arcas_agents/orchestrator/detection_flow.py  (v2)
 
-LangGraph detection flow - adapted for LangGraph 1.1.x
-Stateful graph with PostgreSQL checkpointer.
-One mandatory HITL interrupt before alert publication.
-
-Flow:
-  score_preliminary -> [archive | build_hypothesis]
-  build_hypothesis -> enrich_evidence -> draft_alert
-  -> HITL interrupt (awaiting operator decision)
-  -> [publish_alert | archive_rejected | enrich_evidence]
+Improved scorer with:
+- Judicial bias patterns (differential treatment by political affiliation)
+- Temporal patterns (slow/fast proceedings)
+- Enriched keywords for all 6 categories
 """
 import json, logging, os, uuid
 from typing import TypedDict, Annotated, Literal
@@ -18,8 +13,7 @@ import operator
 from dotenv import load_dotenv
 from langchain_groq import ChatGroq
 from langgraph.graph import StateGraph, END
-from langgraph.checkpoint.postgres import PostgresSaver
-import psycopg
+from langgraph.checkpoint.memory import MemorySaver
 
 load_dotenv()
 log = logging.getLogger(__name__)
@@ -35,6 +29,108 @@ PG_CONN = (
     f"user={os.getenv('POSTGRES_USER','arcas_app')} "
     f"password={os.getenv('POSTGRES_PASSWORD','')}"
 )
+
+# ---------------------------------------------------------------------------
+# Keyword sets per category (Spanish + common variants)
+# ---------------------------------------------------------------------------
+
+# Category A: Public procurement fraud
+KW_CAT_A = [
+    "contrato", "adjudicaci", "licitaci", "concurso", "subvencion",
+    "contratacion publica", "obra publica", "empresa", "adjudicado",
+    "pliego", "oferta", "presupuesto", "sobrecoste", "sobreprecio",
+    "fraccionamiento", "comision", "mordida", "cohecho",
+]
+
+# Category B: Illicit enrichment / revolving doors
+KW_CAT_B = [
+    "patrimonio", "fortuna", "enriquecimiento", "bienes", "declaracion",
+    "puerta giratoria", "fichaje", "exministro", "excargo", "exconcejal",
+    "cuenta bancaria", "offshore", "paraiso fiscal", "sociedad pantalla",
+    "testaferro", "filial", "holding",
+]
+
+# Category C: Judicial patterns - EXPANDED with bias detection
+KW_CAT_C_GENERAL = [
+    "juez", "tribunal", "sentencia", "fiscal", "imputado", "acusado",
+    "diligencias", "auto", "sumario", "instruccion", "juzgado",
+    "audiencia nacional", "tribunal supremo", "sala penal",
+]
+
+KW_CAT_C_BIAS = [
+    # Slow/fast proceedings (differential treatment)
+    "archivo", "archiva", "sobresee", "sobreseimiento", "prescripcion",
+    "prescribe", "caducidad", "dilaciones", "retraso", "demora",
+    "paralizado", "años sin juicio", "lustros", "decada",
+    # Evidentiary basis anomalies
+    "recorte de prensa", "recortes de periodico", "sin pruebas",
+    "indicios", "sospechas", "fuente anonima", "confidente",
+    "testigo protegido", "declaracion policial", "informe policial",
+    "UCO", "UDEF",
+    # Speed anomalies (suspiciously fast)
+    "urgente", "rapidez", "celeridad", "en tiempo record",
+    "inmediatamente detenido", "detenido en horas",
+]
+
+KW_CAT_C_POLITICAL = [
+    # Political affiliation markers near judicial terms
+    "psoe", "pp", "vox", "podemos", "sumar", "ciudadanos",
+    "partido socialista", "partido popular", "militante", "dirigente",
+    "cargo del", "miembro del", "afin al", "proximo al",
+    "gobierno de", "oposicion",
+]
+
+# Category D: Disinformation
+KW_CAT_D = [
+    "bulo", "falso", "mentira", "desinformacion", "fake", "hoax",
+    "manipulado", "desmentido", "verificado", "hecho falso",
+    "fuera de contexto", "sin base", "no es cierto", "erroneo",
+    "tuiteaba", "viralizado", "cadena de whatsapp",
+]
+
+# Category E: Influence networks
+KW_CAT_E = [
+    "red de contactos", "trama", "clan", "grupo organizado",
+    "blanqueo", "financiacion ilegal", "donacion", "partido politico",
+    "tesorero", "caja b", "fondos", "comisionista", "intermediario",
+    "lobbista", "grupo presion",
+]
+
+# Category F: Abuse of public function
+KW_CAT_F = [
+    "nepotismo", "enchufismo", "amiguismo", "contratacion irregular",
+    "cargo de confianza", "asesores", "liberados", "pluriempleo",
+    "incompatibilidad", "conflicto de interes", "uso privado",
+    "vehiculo oficial", "tarjeta de credito publica",
+]
+
+
+def _score_keywords(text: str, keywords: list[str]) -> float:
+    """Score a text against a keyword list. Returns 0-1."""
+    text_lower = text.lower()
+    hits = sum(1 for kw in keywords if kw in text_lower)
+    return min(hits * 0.15, 0.9)
+
+
+def _detect_judicial_bias(text: str) -> float:
+    """
+    Detect potential judicial bias pattern:
+    Co-occurrence of judicial terms + political affiliation markers
+    + speed/evidentiary anomalies.
+    High score = potential differential treatment pattern.
+    """
+    text_lower = text.lower()
+    has_judicial   = any(kw in text_lower for kw in KW_CAT_C_GENERAL)
+    has_political  = any(kw in text_lower for kw in KW_CAT_C_POLITICAL)
+    has_bias       = any(kw in text_lower for kw in KW_CAT_C_BIAS)
+
+    if has_judicial and has_political and has_bias:
+        return 0.75   # Strong signal: all three present
+    elif has_judicial and (has_political or has_bias):
+        return 0.50   # Medium signal: two of three
+    elif has_judicial:
+        return 0.25   # Weak signal: judicial term only
+    return 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -64,35 +160,30 @@ def score_preliminary(state: DetectionState) -> dict:
     event  = state["event_data"]
     title  = (event.get("title") or "").lower()
     source = event.get("source_type", "")
+
     scores = {
-        "cat_a": 0.0, "cat_b": 0.0, "cat_c": 0.0,
-        "cat_d": 0.0, "cat_e": 0.0, "cat_f": 0.0,
+        "cat_a": _score_keywords(title, KW_CAT_A),
+        "cat_b": _score_keywords(title, KW_CAT_B),
+        "cat_c": _detect_judicial_bias(title),
+        "cat_d": _score_keywords(title, KW_CAT_D),
+        "cat_e": _score_keywords(title, KW_CAT_E),
+        "cat_f": _score_keywords(title, KW_CAT_F),
     }
 
-    # Category A: procurement signals in gazette
-    if any(k in title for k in ["contrato", "adjudicaci", "licitaci", "concurso"]):
-        scores["cat_a"] = 0.5
-    if source == "gazette":
-        scores["cat_a"] += 0.1
-
-    # Category C: judicial signals
-    if any(k in title for k in ["juez", "tribunal", "sentencia", "fiscal", "imputado"]):
-        scores["cat_c"] = 0.5
-
-    # Category D: disinformation signals from fact-checkers
+    # Boost for fact-checker sources (always worth analysing)
     if event.get("is_factchecker"):
-        scores["cat_d"] = 0.4
+        scores["cat_d"] = max(scores["cat_d"], 0.45)
 
-    # Category D: media with bulo-related keywords
-    if any(k in title for k in ["bulo", "falso", "desinformaci", "mentira", "fake"]):
-        scores["cat_d"] = max(scores["cat_d"], 0.5)
+    # Boost for gazette source on contracts
+    if source == "gazette" and scores["cat_a"] > 0:
+        scores["cat_a"] = min(scores["cat_a"] + 0.15, 0.9)
 
     overall = max(scores.values())
     log.info(f"Score {state['event_id'][:8]}: {overall:.2f} {scores}")
     return {
         "preliminary_score": overall,
         "score_breakdown":   scores,
-        "reasoning_chain": [f"Preliminary score: {overall:.2f} | breakdown: {scores}"],
+        "reasoning_chain":   [f"Score: {overall:.2f} | {scores}"],
     }
 
 
@@ -102,29 +193,39 @@ def route_after_scoring(state: DetectionState) -> str:
 
 
 def build_hypothesis(state: DetectionState) -> dict:
-    if not GROQ_API_KEY or GROQ_API_KEY.startswith("gsk_YOUR"):
-        hypothesis = f"[STUB] Pattern detected in: {state['event_data'].get('title','')[:100]}"
-        return {
-            "hypothesis":    hypothesis,
-            "reasoning_chain": [f"Hypothesis (stub): {hypothesis}"],
-            "status":        "hypothesis_built",
-        }
+    event     = state["event_data"]
+    breakdown = state.get("score_breakdown", {})
+    top_cat   = max(breakdown, key=breakdown.get) if breakdown else "cat_a"
 
-    llm    = ChatGroq(model=GROQ_MODEL, api_key=GROQ_API_KEY, max_tokens=300)
-    event  = state["event_data"]
+    cat_descriptions = {
+        "cat_a": "public procurement fraud or contract irregularity",
+        "cat_b": "illicit enrichment, revolving doors or undeclared assets",
+        "cat_c": "judicial pattern anomaly - potential differential treatment by political affiliation, evidentiary standard anomaly, or unexplained case speed disparity",
+        "cat_d": "disinformation or false claim that may benefit identifiable actors",
+        "cat_e": "influence network or illegal financing",
+        "cat_f": "abuse of public function, nepotism or incompatibility",
+    }
+
+    if not GROQ_API_KEY or GROQ_API_KEY.startswith("gsk_YOUR"):
+        hypothesis = f"[STUB] {cat_descriptions.get(top_cat,'unknown pattern')} detected in: {event.get('title','')[:100]}"
+        return {"hypothesis": hypothesis, "reasoning_chain": [hypothesis], "status": "hypothesis_built"}
+
+    llm    = ChatGroq(model=GROQ_MODEL, api_key=GROQ_API_KEY, max_tokens=400)
     prompt = (
-        "You are an anti-corruption analyst. Analyse this public record and identify "
-        "any potential corruption, fraud or disinformation patterns. Be concise and factual. "
-        "Cite only what is in the data. Respond with: "
-        "1) Pattern category (A=procurement fraud, B=enrichment, C=judicial, D=disinformation, E=networks, F=abuse) "
-        "2) One-sentence hypothesis 3) Confidence 0-1\n\n"
-        f"Record: {json.dumps(event, ensure_ascii=False)[:1500]}"
+        f"You are an anti-corruption analyst specialising in {cat_descriptions.get(top_cat,'corruption')}. "
+        f"Analyse this public record and identify specific patterns. "
+        f"If category C (judicial), specifically look for: differential speed of proceedings by political affiliation, "
+        f"cases archived without examining evidence, UCO/UDEF reports delivered selectively, "
+        f"prescription used to protect specific political actors. "
+        f"Be factual. Cite only what is in the data. Never accuse - surface patterns only.\n\n"
+        f"Record: {json.dumps(event, ensure_ascii=False)[:1500]}\n\n"
+        f"Respond: 1) Category (A-F) 2) Specific pattern observed 3) Confidence 0-1 4) Who could benefit from this pattern"
     )
     response   = llm.invoke(prompt)
     hypothesis = response.content.strip()
     return {
         "hypothesis":    hypothesis,
-        "reasoning_chain": [f"LLM hypothesis: {hypothesis[:200]}"],
+        "reasoning_chain": [f"LLM ({top_cat}): {hypothesis[:300]}"],
         "status":        "hypothesis_built",
     }
 
@@ -132,23 +233,20 @@ def build_hypothesis(state: DetectionState) -> dict:
 def enrich_evidence(state: DetectionState) -> dict:
     return {
         "evidence_fragments": [state["event_data"]],
-        "reasoning_chain":    ["Evidence: 1 source fragment"],
+        "reasoning_chain":    ["Evidence: source fragment attached"],
         "status":             "evidence_enriched",
     }
 
 
 def draft_alert(state: DetectionState) -> dict:
-    alert_id = str(uuid.uuid4())
-    score    = min(state["preliminary_score"] + 0.15, 0.99)
-
-    # Determine category from score breakdown
+    alert_id  = str(uuid.uuid4())
     breakdown = state.get("score_breakdown", {})
-    category  = max(breakdown, key=breakdown.get) if breakdown else "cat_a"
-    cat_label = category.replace("cat_", "").upper()
+    top_cat   = max(breakdown, key=breakdown.get) if breakdown else "cat_a"
+    score     = min(state["preliminary_score"] + 0.10, 0.99)
 
     alert = {
         "alert_id":          alert_id,
-        "category":          cat_label,
+        "category":          top_cat.replace("cat_", "").upper(),
         "confidence_score":  round(score, 3),
         "nl_justification":  state["hypothesis"],
         "reasoning_chain":   state["reasoning_chain"],
@@ -159,20 +257,16 @@ def draft_alert(state: DetectionState) -> dict:
         "status":            "pending",
     }
     return {
-        "alert_id":       alert_id,
-        "alert_draft":    alert,
+        "alert_id":        alert_id,
+        "alert_draft":     alert,
         "confidence_score": score,
-        "reasoning_chain": [f"Draft alert {alert_id[:8]} cat={cat_label} conf={score:.3f}"],
-        "status":         "draft_ready",
+        "reasoning_chain": [f"Alert {alert_id[:8]} cat={alert['category']} conf={score:.3f}"],
+        "status":          "draft_ready",
     }
 
 
 def hitl_review(state: DetectionState) -> dict:
-    """
-    HITL interrupt node. Graph pauses here.
-    Resumes when operator calls graph.update_state() with hitl_decision.
-    """
-    log.info(f"HITL checkpoint: alert {state.get('alert_id','')[:8]} awaiting operator.")
+    log.info(f"HITL: alert {state.get('alert_id','')[:8]} awaiting operator.")
     return {"status": "awaiting_hitl"}
 
 
@@ -184,8 +278,7 @@ def route_after_hitl(state: DetectionState) -> str:
 
 
 def publish_alert(state: DetectionState) -> dict:
-    """Persist validated alert to PostgreSQL."""
-    import psycopg2, json as _json
+    import psycopg2
     alert = state["alert_draft"]
     try:
         conn = psycopg2.connect(PG_CONN)
@@ -202,33 +295,29 @@ def publish_alert(state: DetectionState) -> dict:
                 "approved" if state.get("hitl_decision") == "approve" else "modified_approved",
                 alert["confidence_score"],
                 alert["nl_justification"],
-                _json.dumps(alert["reasoning_chain"]),
-                _json.dumps({
-                    "source_name": alert.get("source_name",""),
-                    "title":       alert.get("title",""),
-                    "content_url": alert.get("content_url",""),
-                }),
+                json.dumps(alert["reasoning_chain"]),
+                json.dumps({"source_name": alert.get("source_name",""),
+                            "title": alert.get("title",""),
+                            "content_url": alert.get("content_url","")}),
             ))
             conn.commit()
         conn.close()
-        log.info(f"Alert {alert['alert_id'][:8]} published to PostgreSQL.")
+        log.info(f"Alert {alert['alert_id'][:8]} published.")
     except Exception as e:
         log.error(f"Failed to persist alert: {e}")
     return {"status": "published"}
 
 
 def archive_below_threshold(state: DetectionState) -> dict:
-    log.info(f"Event {state['event_id'][:8]} archived (score below threshold)")
     return {"status": "archived_below_threshold"}
 
 
 def archive_rejected(state: DetectionState) -> dict:
-    log.info(f"Alert {state.get('alert_id','?')[:8]} rejected by operator")
     return {"status": "archived_rejected"}
 
 
 # ---------------------------------------------------------------------------
-# Graph assembly
+# Graph
 # ---------------------------------------------------------------------------
 def build_detection_graph():
     graph = StateGraph(DetectionState)
@@ -258,19 +347,10 @@ def build_detection_graph():
     graph.add_edge("archive_below_threshold", END)
     graph.add_edge("archive_rejected",        END)
 
-    # Use in-memory checkpointer for Phase 1 demo
-    # PostgreSQL checkpointer will replace this in Phase 2
-    # when LangGraph and langgraph-checkpoint-postgres versions are aligned
-    from langgraph.checkpoint.memory import MemorySaver
     saver = MemorySaver()
-
-    return graph.compile(
-        checkpointer=saver,
-        interrupt_before=["hitl_review"],
-    )
+    return graph.compile(checkpointer=saver, interrupt_before=["hitl_review"])
 
 
-# Module-level graph - import this in run_agents.py
 try:
     detection_graph = build_detection_graph()
     log.info("Detection graph compiled successfully.")
