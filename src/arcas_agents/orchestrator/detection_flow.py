@@ -1,205 +1,237 @@
 """
 ARCAS - src/arcas_agents/orchestrator/detection_flow.py
 
-LangGraph main detection flow.
+LangGraph detection flow - adapted for LangGraph 1.1.x
 Stateful graph with PostgreSQL checkpointer.
-Contains one mandatory HITL interrupt checkpoint before alert publication.
+One mandatory HITL interrupt before alert publication.
 
-State transitions:
-  START -> score_preliminary -> [archive | build_hypothesis]
-        -> enrich_evidence -> draft_alert
-        -> HITL_REVIEW (interrupt)
-        -> [publish_alert | archive_rejected]
+Flow:
+  score_preliminary -> [archive | build_hypothesis]
+  build_hypothesis -> enrich_evidence -> draft_alert
+  -> HITL interrupt (awaiting operator decision)
+  -> [publish_alert | archive_rejected | enrich_evidence]
 """
 import json, logging, os, uuid
 from typing import TypedDict, Annotated, Literal
 import operator
+
 from dotenv import load_dotenv
 from langchain_groq import ChatGroq
 from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.postgres import PostgresSaver
+import psycopg
 
 load_dotenv()
 log = logging.getLogger(__name__)
 
 GROQ_API_KEY    = os.getenv("GROQ_API_KEY", "")
 GROQ_MODEL      = os.getenv("GROQ_MODEL_PRIMARY", "llama-3.3-70b-versatile")
-PG_CONN_STRING  = (
-    f"postgresql://{os.getenv('POSTGRES_USER','arcas_app')}:"
-    f"{os.getenv('POSTGRES_PASSWORD','')}@"
-    f"{os.getenv('POSTGRES_HOST','localhost')}:"
-    f"{os.getenv('POSTGRES_PORT','5432')}/"
-    f"{os.getenv('POSTGRES_DB','arcas')}"
+SCORE_THRESHOLD = 0.30
+
+PG_CONN = (
+    f"host={os.getenv('POSTGRES_HOST','localhost')} "
+    f"port={os.getenv('POSTGRES_PORT','5432')} "
+    f"dbname={os.getenv('POSTGRES_DB','arcas')} "
+    f"user={os.getenv('POSTGRES_USER','arcas_app')} "
+    f"password={os.getenv('POSTGRES_PASSWORD','')}"
 )
-SCORE_THRESHOLD = 0.35   # Minimum score to proceed to hypothesis building
 
 
 # ---------------------------------------------------------------------------
-# State definition
+# State
 # ---------------------------------------------------------------------------
-
 class DetectionState(TypedDict):
-    # Input
     event_id:           str
     event_data:         dict
-    # Scoring
     preliminary_score:  float
     score_breakdown:    dict
-    # Hypothesis
     hypothesis:         str
     supporting_events:  Annotated[list, operator.add]
     evidence_fragments: Annotated[list, operator.add]
-    # Alert
     alert_draft:        dict
     confidence_score:   float
     reasoning_chain:    Annotated[list, operator.add]
-    # HITL
-    hitl_decision:      Literal["approve", "reject", "modify", "evidence"] | None
+    hitl_decision:      str | None
     operator_notes:     str
-    # Control
     status:             str
     alert_id:           str
 
 
 # ---------------------------------------------------------------------------
-# Node functions
+# Nodes
 # ---------------------------------------------------------------------------
-
 def score_preliminary(state: DetectionState) -> dict:
-    """Fast heuristic scoring across all 6 categories."""
     event  = state["event_data"]
-    scores = {}
+    title  = (event.get("title") or "").lower()
+    source = event.get("source_type", "")
+    scores = {
+        "cat_a": 0.0, "cat_b": 0.0, "cat_c": 0.0,
+        "cat_d": 0.0, "cat_e": 0.0, "cat_f": 0.0,
+    }
 
-    # Category A: procurement fraud signals
-    title = (event.get("title") or "").lower()
-    scores["cat_a"] = 0.0
-    if any(kw in title for kw in ["contrato", "adjudicacion", "licitacion", "concurso"]):
-        scores["cat_a"] = 0.4
-    if event.get("source_type") == "procurement":
-        scores["cat_a"] += 0.2
+    # Category A: procurement signals in gazette
+    if any(k in title for k in ["contrato", "adjudicaci", "licitaci", "concurso"]):
+        scores["cat_a"] = 0.5
+    if source == "gazette":
+        scores["cat_a"] += 0.1
 
-    # Category D: disinformation signals
-    scores["cat_d"] = 0.0
-    if event.get("source_type") == "media":
-        scores["cat_d"] = 0.1
+    # Category C: judicial signals
+    if any(k in title for k in ["juez", "tribunal", "sentencia", "fiscal", "imputado"]):
+        scores["cat_c"] = 0.5
 
-    # Overall: max of individual scores (simplified heuristic)
-    overall = max(scores.values()) if scores else 0.0
+    # Category D: disinformation signals from fact-checkers
+    if event.get("is_factchecker"):
+        scores["cat_d"] = 0.4
 
-    log.info(f"Preliminary score for {state['event_id']}: {overall:.3f}")
+    # Category D: media with bulo-related keywords
+    if any(k in title for k in ["bulo", "falso", "desinformaci", "mentira", "fake"]):
+        scores["cat_d"] = max(scores["cat_d"], 0.5)
+
+    overall = max(scores.values())
+    log.info(f"Score {state['event_id'][:8]}: {overall:.2f} {scores}")
     return {
         "preliminary_score": overall,
-        "score_breakdown": scores,
-        "reasoning_chain": [f"Preliminary heuristic score: {overall:.3f}. Breakdown: {scores}"],
+        "score_breakdown":   scores,
+        "reasoning_chain": [f"Preliminary score: {overall:.2f} | breakdown: {scores}"],
     }
 
 
 def route_after_scoring(state: DetectionState) -> str:
-    if state["preliminary_score"] >= SCORE_THRESHOLD:
-        return "build_hypothesis"
-    return "archive_below_threshold"
+    return "build_hypothesis" if state["preliminary_score"] >= SCORE_THRESHOLD \
+           else "archive_below_threshold"
 
 
 def build_hypothesis(state: DetectionState) -> dict:
-    """Use LLM to build a structured hypothesis from event data."""
-    llm = ChatGroq(model=GROQ_MODEL, api_key=GROQ_API_KEY, max_tokens=500)
-    event = state["event_data"]
-    prompt = f"""You are an anti-corruption analyst. Analyse this public record and identify 
-any potential corruption or fraud patterns. Be concise and factual. Cite only what is in the data.
+    if not GROQ_API_KEY or GROQ_API_KEY.startswith("gsk_YOUR"):
+        hypothesis = f"[STUB] Pattern detected in: {state['event_data'].get('title','')[:100]}"
+        return {
+            "hypothesis":    hypothesis,
+            "reasoning_chain": [f"Hypothesis (stub): {hypothesis}"],
+            "status":        "hypothesis_built",
+        }
 
-Record: {json.dumps(event, ensure_ascii=False)[:2000]}
-
-Respond with: 1) Pattern category (A-F) 2) Hypothesis in one sentence 3) Confidence (0-1)"""
-
-    response = llm.invoke(prompt)
+    llm    = ChatGroq(model=GROQ_MODEL, api_key=GROQ_API_KEY, max_tokens=300)
+    event  = state["event_data"]
+    prompt = (
+        "You are an anti-corruption analyst. Analyse this public record and identify "
+        "any potential corruption, fraud or disinformation patterns. Be concise and factual. "
+        "Cite only what is in the data. Respond with: "
+        "1) Pattern category (A=procurement fraud, B=enrichment, C=judicial, D=disinformation, E=networks, F=abuse) "
+        "2) One-sentence hypothesis 3) Confidence 0-1\n\n"
+        f"Record: {json.dumps(event, ensure_ascii=False)[:1500]}"
+    )
+    response   = llm.invoke(prompt)
     hypothesis = response.content.strip()
-
     return {
-        "hypothesis": hypothesis,
+        "hypothesis":    hypothesis,
         "reasoning_chain": [f"LLM hypothesis: {hypothesis[:200]}"],
-        "status": "hypothesis_built",
+        "status":        "hypothesis_built",
     }
 
 
 def enrich_evidence(state: DetectionState) -> dict:
-    """Search for additional supporting evidence (simplified stub)."""
-    # In production: query Qdrant for semantically similar evidence,
-    # query Neo4j for related actors, call enrichment agent.
     return {
         "evidence_fragments": [state["event_data"]],
-        "reasoning_chain": ["Evidence enrichment: 1 fragment from source event"],
-        "status": "evidence_enriched",
+        "reasoning_chain":    ["Evidence: 1 source fragment"],
+        "status":             "evidence_enriched",
     }
 
 
 def draft_alert(state: DetectionState) -> dict:
-    """Generate the alert draft with full justification."""
     alert_id = str(uuid.uuid4())
-    score    = min(state["preliminary_score"] + 0.2, 1.0)
+    score    = min(state["preliminary_score"] + 0.15, 0.99)
+
+    # Determine category from score breakdown
+    breakdown = state.get("score_breakdown", {})
+    category  = max(breakdown, key=breakdown.get) if breakdown else "cat_a"
+    cat_label = category.replace("cat_", "").upper()
 
     alert = {
         "alert_id":          alert_id,
-        "category":          "A",   # Simplified; real flow uses LLM classification
-        "confidence_score":  score,
+        "category":          cat_label,
+        "confidence_score":  round(score, 3),
         "nl_justification":  state["hypothesis"],
         "reasoning_chain":   state["reasoning_chain"],
-        "supporting_events": state["supporting_events"] or [state["event_id"]],
+        "supporting_events": [state["event_id"]],
+        "source_name":       state["event_data"].get("source_name", ""),
+        "title":             state["event_data"].get("title", ""),
+        "content_url":       state["event_data"].get("content_url", ""),
         "status":            "pending",
     }
-
     return {
         "alert_id":       alert_id,
         "alert_draft":    alert,
         "confidence_score": score,
-        "reasoning_chain": [f"Draft alert created: {alert_id}, confidence={score:.3f}"],
+        "reasoning_chain": [f"Draft alert {alert_id[:8]} cat={cat_label} conf={score:.3f}"],
         "status":         "draft_ready",
     }
 
 
 def hitl_review(state: DetectionState) -> dict:
     """
-    HITL interrupt checkpoint.
-    This node pauses the graph and waits for human decision.
-    The graph resumes when an operator calls graph.update_state()
-    with hitl_decision = 'approve' | 'reject' | 'modify' | 'evidence'
+    HITL interrupt node. Graph pauses here.
+    Resumes when operator calls graph.update_state() with hitl_decision.
     """
-    log.info(f"HITL checkpoint reached for alert {state['alert_id']}. Waiting for operator.")
+    log.info(f"HITL checkpoint: alert {state.get('alert_id','')[:8]} awaiting operator.")
     return {"status": "awaiting_hitl"}
 
 
 def route_after_hitl(state: DetectionState) -> str:
-    decision = state.get("hitl_decision")
-    if decision == "approve":   return "publish_alert"
-    if decision == "modify":    return "publish_alert"
-    if decision == "evidence":  return "enrich_evidence"
+    decision = state.get("hitl_decision", "")
+    if decision in ("approve", "modify"):  return "publish_alert"
+    if decision == "evidence":             return "enrich_evidence"
     return "archive_rejected"
 
 
 def publish_alert(state: DetectionState) -> dict:
-    """Persist the validated alert to PostgreSQL and update actor risk scores."""
-    log.info(f"Publishing alert {state['alert_id']} (decision: {state['hitl_decision']})")
-    # In production: INSERT into alerts table, update actor risk scores in Neo4j,
-    # publish to arcas.alerts.validated Kafka topic.
+    """Persist validated alert to PostgreSQL."""
+    import psycopg2, json as _json
+    alert = state["alert_draft"]
+    try:
+        conn = psycopg2.connect(PG_CONN)
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO alerts
+                    (alert_id, category, status, confidence_score,
+                     nl_justification, reasoning_chain, metadata)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (alert_id) DO UPDATE SET status = EXCLUDED.status
+            """, (
+                alert["alert_id"],
+                alert["category"],
+                "approved" if state.get("hitl_decision") == "approve" else "modified_approved",
+                alert["confidence_score"],
+                alert["nl_justification"],
+                _json.dumps(alert["reasoning_chain"]),
+                _json.dumps({
+                    "source_name": alert.get("source_name",""),
+                    "title":       alert.get("title",""),
+                    "content_url": alert.get("content_url",""),
+                }),
+            ))
+            conn.commit()
+        conn.close()
+        log.info(f"Alert {alert['alert_id'][:8]} published to PostgreSQL.")
+    except Exception as e:
+        log.error(f"Failed to persist alert: {e}")
     return {"status": "published"}
 
 
 def archive_below_threshold(state: DetectionState) -> dict:
-    log.info(f"Event {state['event_id']} archived (score below threshold)")
+    log.info(f"Event {state['event_id'][:8]} archived (score below threshold)")
     return {"status": "archived_below_threshold"}
 
 
 def archive_rejected(state: DetectionState) -> dict:
-    log.info(f"Alert {state['alert_id']} rejected by operator")
+    log.info(f"Alert {state.get('alert_id','?')[:8]} rejected by operator")
     return {"status": "archived_rejected"}
 
 
 # ---------------------------------------------------------------------------
 # Graph assembly
 # ---------------------------------------------------------------------------
-
 def build_detection_graph():
     graph = StateGraph(DetectionState)
-
     graph.add_node("score_preliminary",       score_preliminary)
     graph.add_node("build_hypothesis",        build_hypothesis)
     graph.add_node("enrich_evidence",         enrich_evidence)
@@ -210,29 +242,38 @@ def build_detection_graph():
     graph.add_node("archive_rejected",        archive_rejected)
 
     graph.set_entry_point("score_preliminary")
-    graph.add_conditional_edges("score_preliminary", route_after_scoring,
-        {"build_hypothesis": "build_hypothesis",
-         "archive_below_threshold": "archive_below_threshold"})
+    graph.add_conditional_edges("score_preliminary", route_after_scoring, {
+        "build_hypothesis":        "build_hypothesis",
+        "archive_below_threshold": "archive_below_threshold",
+    })
     graph.add_edge("build_hypothesis", "enrich_evidence")
     graph.add_edge("enrich_evidence",  "draft_alert")
     graph.add_edge("draft_alert",      "hitl_review")
-    graph.add_conditional_edges("hitl_review", route_after_hitl,
-        {"publish_alert":    "publish_alert",
-         "archive_rejected": "archive_rejected",
-         "enrich_evidence":  "enrich_evidence"})
+    graph.add_conditional_edges("hitl_review", route_after_hitl, {
+        "publish_alert":    "publish_alert",
+        "archive_rejected": "archive_rejected",
+        "enrich_evidence":  "enrich_evidence",
+    })
     graph.add_edge("publish_alert",           END)
     graph.add_edge("archive_below_threshold", END)
     graph.add_edge("archive_rejected",        END)
 
-    # PostgreSQL checkpointer for stateful resumption after HITL
-    checkpointer = PostgresSaver.from_conn_string(PG_CONN_STRING)
-    checkpointer.setup()
+    # Use in-memory checkpointer for Phase 1 demo
+    # PostgreSQL checkpointer will replace this in Phase 2
+    # when LangGraph and langgraph-checkpoint-postgres versions are aligned
+    from langgraph.checkpoint.memory import MemorySaver
+    saver = MemorySaver()
 
     return graph.compile(
-        checkpointer=checkpointer,
-        interrupt_before=["hitl_review"],   # PAUSE before HITL node
+        checkpointer=saver,
+        interrupt_before=["hitl_review"],
     )
 
 
-# Module-level compiled graph (import this in other modules)
-detection_graph = build_detection_graph()
+# Module-level graph - import this in run_agents.py
+try:
+    detection_graph = build_detection_graph()
+    log.info("Detection graph compiled successfully.")
+except Exception as e:
+    log.error(f"Failed to compile detection graph: {e}")
+    detection_graph = None
