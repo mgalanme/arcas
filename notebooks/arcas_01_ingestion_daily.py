@@ -315,12 +315,12 @@ for record, scores in above[:5]:  # Only 5 to test
     conf = min(max(scores.values()) + 0.10, 0.99)
     try:
         hypothesis = groq_invoke(
-            f"Anti-corruption analyst. Category {cat}.\n"
-            f"Title: {record['title']}\nSource: {record['source_name']}\n"
-            f"Respond: 1) Pattern 2) Confidence 3) Who benefits"
+            f"Eres un analista anticorrupción. Analiza este registro para la categoría {cat}.\n"
+            f"Titular: {record['title']}\nFuente: {record['source_name']}\n"
+            f"Responde en español: 1) Patrón observado 2) Confianza 0-1 3) Quién se beneficia"
         )
     except Exception as e:
-        hypothesis = f"[Pattern] {cat}: {record['title'][:100]}"
+        hypothesis = f"[Patrón detectado] Categoría {cat}: {record['title'][:100]}"
     alerts_to_save.append({
         "alert_id": str(uuid.uuid4()), "category": cat, "status": "pending",
         "confidence_score": round(conf, 3), "nl_justification": hypothesis,
