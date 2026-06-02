@@ -256,6 +256,36 @@ def draft_alert(state: DetectionState) -> dict:
         "content_url":       state["event_data"].get("content_url", ""),
         "status":            "pending",
     }
+
+    # Persist to PostgreSQL immediately so the dashboard shows it
+    # thread_id == alert_id (C-08 fix) so HITL endpoint can resume
+    try:
+        import psycopg2 as _pg2
+        _conn = _pg2.connect(PG_CONN)
+        with _conn.cursor() as _cur:
+            _cur.execute("""
+                INSERT INTO alerts
+                    (alert_id, category, status, confidence_score,
+                     nl_justification, reasoning_chain, metadata)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (alert_id) DO NOTHING
+            """, (
+                alert["alert_id"], alert["category"], "pending",
+                alert["confidence_score"], alert["nl_justification"],
+                json.dumps(alert["reasoning_chain"]),
+                json.dumps({
+                    "source_name": alert.get("source_name",""),
+                    "title":       alert.get("title",""),
+                    "content_url": alert.get("content_url",""),
+                    "thread_id":   alert_id,
+                }),
+            ))
+            _conn.commit()
+        _conn.close()
+        log.info(f"Alert {alert_id[:8]} persisted to PostgreSQL.")
+    except Exception as _e:
+        log.error(f"Failed to persist alert {alert_id[:8]}: {_e}")
+
     return {
         "alert_id":        alert_id,
         "alert_draft":     alert,
