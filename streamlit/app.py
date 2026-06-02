@@ -220,11 +220,10 @@ def update_alert(alert_id: str, status: str, notes: str = "") -> bool:
         return False
     try:
         with conn.cursor() as cur:
-            cur.execute("""
-                UPDATE arcas_processed.alerts
-                SET status = ?, metadata = to_json(map('operator_notes', ?))
-                WHERE alert_id = ?
-            """, [status, notes, alert_id])
+            cur.execute(
+                "UPDATE arcas_processed.alerts SET status = ? WHERE alert_id = ?",
+                [status, alert_id]
+            )
         return True
     except Exception as e:
         st.error(f"Update error: {e}")
@@ -517,26 +516,26 @@ elif page == "✍️ Generador de Posts":
             source   = selected["source_name"]
             conf     = float(selected["confidence_score"])
 
-            prompt = f"""You are an investigative journalist writing a {tone.lower()} social media post in {lang_name}.
+            prompt = f"""Eres un periodista de investigación escribiendo un post de redes sociales de tono {tone.lower()} en {lang_name}.
 
-The post is for {platform} and must be under {char_limit} characters.
+El post es para {platform} y debe tener menos de {char_limit} caracteres.
 
-Context:
-- Pattern detected: {cat_name} (Category {cat})
-- Source: {source}
-- Headline: {title}
-- AI analysis: {justif[:400]}
-- Confidence score: {conf:.0%}
+Contexto:
+- Patrón detectado: {cat_name} (Categoría {cat})
+- Fuente: {source}
+- Titular: {title}
+- Análisis: {justif[:400]}
+- Nivel de confianza: {conf:.0%}
 
-Requirements:
-- Write entirely in {lang_name}
-- Be factual, politically neutral, never accuse — surface patterns only
-- Include relevant hashtags at the end
-- Do NOT mention AI, algorithms, or ARCAS system
-- Tone: {tone}
-- Max {char_limit} characters
+Requisitos:
+- Escribe íntegramente en {lang_name}
+- Sé factual, políticamente neutral, nunca acuses — solo señala patrones
+- Incluye hashtags relevantes al final
+- NO menciones IA, algoritmos ni el sistema ARCAS
+- Tono: {tone}
+- Máximo {char_limit} caracteres
 
-Write only the post text, nothing else."""
+Escribe únicamente el texto del post, nada más."""
 
             with st.spinner("Generando post..."):
                 post_text = groq_generate(prompt)
