@@ -17,7 +17,7 @@
 # Celda 1: Imports y configuracion
 
 import requests, json, hashlib, re, logging, time
-from datetime import date, timedelta
+from datetime import date, timedelta, datetime, timezone
 import xml.etree.ElementTree as ET
 from bs4 import BeautifulSoup
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -96,13 +96,16 @@ print(f"GROQ: {bool(GROQ_API_KEY)} | Neo4j: {bool(NEO4J_URI)} | Fast model: {GRO
 
 # COMMAND ----------
 
-# Celda 2: TRUNCAR (solo uso manual excepcional)
-
-# spark.sql(f"TRUNCATE TABLE {TBL_ARTICLES}")
-# spark.sql(f"TRUNCATE TABLE {TBL_ALERTS}")
-# spark.sql(f"TRUNCATE TABLE {TBL_ENTITIES}")
-# spark.sql(f"TRUNCATE TABLE {TBL_RELATIONS}")
-# print("Truncado completo")
+# Celda 2: Truncado condicional via parametro del Job
+truncate = get_param("TRUNCATE_TABLES", "false").lower() == "true"
+if truncate:
+    spark.sql(f"TRUNCATE TABLE {TBL_ARTICLES}")
+    spark.sql(f"TRUNCATE TABLE {TBL_ALERTS}")
+    spark.sql(f"TRUNCATE TABLE {TBL_ENTITIES}")
+    spark.sql(f"TRUNCATE TABLE {TBL_RELATIONS}")
+    print("Tablas truncadas — recarga completa forzada")
+else:
+    print("Truncado omitido — modo incremental")
 
 # COMMAND ----------
 
@@ -423,7 +426,7 @@ HEADERS_HTTP = {
 
 MEDIA_SOURCES = [
     # Prensa generalista
-   ("El Pais", "https://feeds.elpais.com/mrss-s/pages/ep/site/elpais.com/section/espana/portada", "es", False),
+    ("El Pais", "https://feeds.elpais.com/mrss-s/pages/ep/site/elpais.com/section/espana/portada", "es", False),
     ("El Mundo",         "https://www.elmundo.es/espana.html",         "es", False),
     ("ABC",              "https://www.abc.es/espana/",                 "es", False),
     ("La Vanguardia",    "https://www.lavanguardia.com/politica",      "es", False),
@@ -439,9 +442,9 @@ MEDIA_SOURCES = [
     ("Expansion",        "https://www.expansion.com/economia.html",    "es", False),
     # Fuentes judiciales y transparencia
     ("Poder Judicial",   "https://www.poderjudicial.es/cgpj/es/Poder-Judicial/Noticias-Judiciales/", "es", False),
-   ("Transparencia", "https://www.transparencia.gob.es/transparencia/transparencia_Home/index.html", "es", False),
+    ("Transparencia", "https://www.transparencia.gob.es/transparencia/transparencia_Home/index.html", "es", False),
     ("Civio",            "https://civio.es/noticias/",                 "es", False),
-    ("El Salto",         "https://www.elsaltodiario.com/politica",     "es", False),
+    ("El Salto", "https://www.elsaltodiario.com/", "es", False),
     # Salud y pseudociencias
     ("El Mundo Salud",   "https://www.elmundo.es/ciencia-y-salud/salud.html", "es", False),
     ("El Confidencial Salud","https://www.elconfidencial.com/bienestar/", "es", False),
@@ -450,14 +453,15 @@ MEDIA_SOURCES = [
     ("AP News Spain",    "https://apnews.com/hub/spain",               "en", False),
     ("Transparency Intl","https://www.transparency.org/en/news",       "en", False),
     # Fact-checkers generalistas
-    ("Maldita.es",       "https://maldita.es/malditobulo/",            "es", True),
+    ("Maldita.es", "https://maldita.es/malditobulo/", "es", True),
     ("Newtral",          "https://www.newtral.es/zona-verificacion/fact-check/", "es", True),
     ("EFE Verifica",     "https://verifica.efe.com/",                  "es", True),
-    ("RTVE Verifica",    "https://www.rtve.es/noticias/verificacion/", "es", True),
+    ("RTVE Verifica",    "https://www.rtve.es/noticias/verificartve/", "es", True),
     ("Snopes",           "https://www.snopes.com/fact-check/",         "en", True),
     ("PolitiFact",       "https://www.politifact.com/factchecks/",     "en", True),
     # Fact-checkers ciencia y salud
-    ("Maldita Ciencia",  "https://maldita.es/malditaciencia/",         "es", True),
+    ("Maldita Ciencia", "https://maldita.es/malditaciencia/", "es", True),
+    ("APETP",           "https://www.apetp.com/lista-de-terapias-pseudocientificas/", "es", True)
 ]
 
 def fetch_snippet(url, max_chars=1000):
@@ -568,7 +572,8 @@ print(f"Media (parallel): {len(media_records)} in {time.time()-t_scrape:.1f}s")
 
 # COMMAND ----------
 
-# Celda 9: Guardar en Delta con dedup, traduccion y clasificacion de topic (v8 estable)
+# COMMAND ----------
+# Celda 9: Guardar en Delta con dedup, traduccion y clasificacion de topic
 
 from pyspark.sql import Row
 from pyspark.sql.functions import current_timestamp
@@ -584,27 +589,7 @@ if all_records:
     new_df = cand_df.join(existing_hashes, on="content_hash", how="left_anti")
     new_records = [r.asDict() for r in new_df.collect()]
 
-print(f"New: {len(new_records)} (dedup via Spark left_anti join)")
-
-llm_calls_estimate = 0
-if new_records and GROQ_API_KEY:
-    # 1. Traducciones (batches pequeños)
-    t_tr = time.time()
-    eng = [r for r in new_records if r.get("language") != "es"]
-    calls_tr = translate_titles_batch(eng)
-    llm_calls_estimate += calls_tr
-    for r in new_records:
-        if r.get("language") == "es" and not r.get("title_es"):
-            r["title_es"] = r.get("title", "")
-    print(f"  Translations: {len(eng)} items, ~{calls_tr} LLM call(s) in {time.time()-t_tr:.1f}s")
-
-    # 2. Clasificación (heurística + batches pequeños)
-    t_cl = time.time()
-    media_new = [r for r in new_records if r.get("source_type") != "gazette"]
-    print(f"Classifying topics for {len(media_new)} media (heuristic + small batches <=6)...")
-    calls_cl = classify_topics_batch(media_new, use_heuristic=True)
-    llm_calls_estimate += calls_cl
-    print(f"  Topics done in {time.time()-t_cl:.1f}s")
+print(f"New: {len(new_records)} (dedup via Spark)")
 
 # Columnas exactas de TBL_ARTICLES — nunca mas, nunca menos
 ARTICLE_COLS = [
@@ -613,14 +598,47 @@ ARTICLE_COLS = [
     "jurisdiction", "content_hash", "is_factchecker", "topic"
 ]
 
+if new_records and GROQ_API_KEY:
+    # 1. Traduccion: solo titulos en ingles, solo con marcadores ausentes
+    t_tr = time.time()
+    for r in new_records:
+        if r.get("language") != "es" and not r.get("title_es"):
+            r["title_es"] = translate_to_spanish(r.get("title", ""))
+            time.sleep(0.5)
+        elif not r.get("title_es"):
+            r["title_es"] = r.get("title", "")
+    print(f"  Translations done in {time.time()-t_tr:.1f}s")
+
+    # 2. Clasificacion topic: 100% heuristica, sin LLM
+    # La heuristica cubre ~42% con keywords. El resto va a OTRO.
+    # Eliminamos completamente los 50 LLM calls que generaban 429.
+    t_cl = time.time()
+    heuristic_hits = 0
+    for r in new_records:
+        if r.get("source_type") == "gazette":
+            r["topic"] = "OFICIAL"
+            continue
+        if r.get("topic"):
+            continue
+        h = heuristic_classify(
+            r.get("title_es") or r.get("title", ""),
+            r.get("content_snippet", ""),
+            r.get("source_name", ""),
+            r.get("is_factchecker", False)
+        )
+        r["topic"] = h if h else "OTRO"
+        heuristic_hits += 1
+    print(f"  Topics: {heuristic_hits} heuristic (0 LLM calls) in {time.time()-t_cl:.1f}s")
+
+# Limpiar y escribir en Delta
 if new_records:
     clean = []
     for r in new_records:
         row = {k: r.get(k, "") for k in ARTICLE_COLS}
         row["is_factchecker"] = bool(r.get("is_factchecker", False))
-        row["title_es"]       = row["title_es"] or row["title"]
-        row["topic"]          = row["topic"] or ("OFICIAL" if row["source_type"] == "gazette" else "OTRO")
-        row["content_snippet"]= row["content_snippet"] or ""
+        row["title_es"]        = row["title_es"] or row["title"]
+        row["topic"]           = row["topic"] or "OTRO"
+        row["content_snippet"] = row["content_snippet"] or ""
         clean.append(row)
 
     df_new = spark.createDataFrame([Row(**r) for r in clean])
@@ -640,9 +658,9 @@ if new_records:
             n.jurisdiction, n.content_hash, n.is_factchecker, n.topic, n.ingested_at
         )
     """)
-    print(f"Merged {len(clean)} articles")
-
-print(f"Celda 9: {time.time()-t9:.1f}s | LLM calls: ~{llm_calls_estimate}")
+    print(f"Merged {len(clean)} articles in {time.time()-t9:.1f}s total")
+else:
+    print("No new articles today.")
 
 # COMMAND ----------
 
@@ -800,7 +818,7 @@ def _process_one_for_alert(record, scores):
         "alert_id":alert_id,"category":cat,"topic":topic,"status":"pending",
         "confidence_score":conf,"nl_justification":analysis,"deep_analysis":analysis,
         "source_name":source,"title":title_es,"content_url":record["content_url"],
-        "created_at":datetime.utcnow().isoformat(),
+        "created_at": datetime.now(timezone.utc).isoformat(),
     }
     log.info(f"  [{cat}/{topic} {conf:.2f} {cred_pct}%] {title_es[:55]}")
 
@@ -823,6 +841,7 @@ def _process_one_for_alert(record, scores):
     except Exception:
         pass
 
+    time.sleep(5)
     return alert, entities
 
 alerts_to_save   = []
@@ -830,21 +849,18 @@ entities_to_save = []
 limit = min(len(above), 15)
 
 t11 = time.time()
-if above and limit > 0:
-    with ThreadPoolExecutor(max_workers=5) as ex:
-        futures = {
-            ex.submit(_process_one_for_alert, record, scores): (record, scores)
-            for record, scores in above[:limit]
-        }
-        for fut in as_completed(futures):
-            try:
-                al, ents = fut.result()
-                alerts_to_save.append(al)
-                entities_to_save.extend(ents)
-            except Exception as e:
-                log.warning(f"Alert processing error: {e}")
+log.info("Esperando 20s para recuperar cuota Groq tras celda 9...")
+time.sleep(20)
 
-print(f"Alerts: {len(alerts_to_save)} | Entities: {len(entities_to_save)} (parallel in {time.time()-t11:.1f}s)")
+for record, scores in above[:limit]:
+    try:
+        al, ents = _process_one_for_alert(record, scores)
+        alerts_to_save.append(al)
+        entities_to_save.extend(ents)
+    except Exception as e:
+        log.warning(f"Alert processing error: {e}")
+
+print(f"Alerts: {len(alerts_to_save)} | Entities: {len(entities_to_save)} | Time: {time.time()-t11:.1f}s")
 
 # COMMAND ----------
 
