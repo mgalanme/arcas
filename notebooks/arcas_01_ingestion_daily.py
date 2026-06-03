@@ -6,6 +6,7 @@
 #   - Delta historico: tablas entities y relations para nivel 2
 
 # COMMAND ----------
+
 # Celda 1: Imports y configuracion
 
 import requests, json, hashlib, re, logging, time
@@ -42,6 +43,7 @@ TBL_RELATIONS = f"{DB_PROCESSED}.relations"
 print(f"GROQ: {bool(GROQ_API_KEY)} | Neo4j: {bool(NEO4J_URI)}")
 
 # COMMAND ----------
+
 # Celda 2: Credibilidad de fuentes
 # Score 0.0-1.0 segun historial documentado (EEAS, Reuters Fact Check, Maldita)
 
@@ -60,6 +62,7 @@ def get_credibility(source): return SOURCE_CREDIBILITY.get(source, 0.60)
 print("Credibility scores OK")
 
 # COMMAND ----------
+
 # Celda 3: Groq helpers
 
 def groq_invoke(prompt, max_tokens=500, temperature=0.1):
@@ -89,6 +92,7 @@ def translate_to_spanish(title):
 print("Groq helpers OK")
 
 # COMMAND ----------
+
 # Celda 4: Crear / migrar tablas Delta
 
 spark.sql(f"CREATE DATABASE IF NOT EXISTS {DB_RAW}")
@@ -127,6 +131,7 @@ for tbl, col, td in [(TBL_ARTICLES,"title_es","STRING"),
 print("Tables ready")
 
 # COMMAND ----------
+
 # Celda 5: Fuentes
 
 HEADERS_HTTP = {
@@ -204,6 +209,7 @@ def scrape_source(name, url, language, is_fc):
 print(f"Sources: {len(MEDIA_SOURCES)}")
 
 # COMMAND ----------
+
 # Celda 6: Ingesta BOE
 
 def fetch_boe(pub_date):
@@ -242,6 +248,7 @@ for days_back in range(3):
 print(f"BOE total: {len(boe_records)}")
 
 # COMMAND ----------
+
 # Celda 7: Ingesta medios
 
 media_records = []
@@ -250,6 +257,7 @@ for name, url, lang, is_fc in MEDIA_SOURCES:
 print(f"Media total: {len(media_records)}")
 
 # COMMAND ----------
+
 # Celda 8: Guardar con dedup y traduccion
 
 from pyspark.sql import Row
@@ -278,6 +286,7 @@ if new_records:
     print(f"Saved {len(new_records)}")
 
 # COMMAND ----------
+
 # Celda 9: Scoring
 
 KW_A=["contrato","adjudicaci","licitaci","concurso","subvencion","obra publica",
@@ -326,6 +335,7 @@ above      = [(r,s) for r,s in scored if max(s.values())>=THRESHOLD]
 print(f"Candidates: {len(candidates)} | Above threshold: {len(above)}")
 
 # COMMAND ----------
+
 # Celda 10: Analisis profundo con calidad probatoria (Nivel 1)
 
 import uuid
@@ -442,6 +452,7 @@ for record, scores in above[:limit]:
 print(f"Alerts: {len(alerts_to_save)} | Entities: {len(entities_to_save)}")
 
 # COMMAND ----------
+
 # Celda 11: Guardar alertas y entidades en Delta
 
 if alerts_to_save:
@@ -452,11 +463,16 @@ if alerts_to_save:
     print(f"Saved {len(alerts_to_save)} alerts")
 
 if entities_to_save:
+    from pyspark.sql.functions import to_date, col
     df_e = spark.createDataFrame([Row(**e) for e in entities_to_save])
+    df_e = df_e.withColumn("first_seen", to_date("first_seen")) \
+               .withColumn("last_seen", to_date("last_seen")) \
+               .withColumn("mention_count", col("mention_count").cast("int"))
     df_e.write.format("delta").mode("append").saveAsTable(TBL_ENTITIES)
     print(f"Saved {len(entities_to_save)} entities")
 
 # COMMAND ----------
+
 # Celda 12: Escribir en Neo4j Aura
 
 if NEO4J_URI and entities_to_save:
@@ -495,6 +511,7 @@ else:
     print("Neo4j: skipped")
 
 # COMMAND ----------
+
 # Celda 13: Resumen
 
 ta  = spark.sql(f"SELECT count(*) AS n FROM {TBL_ARTICLES}").collect()[0]["n"]
