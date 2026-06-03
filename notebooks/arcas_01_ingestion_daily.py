@@ -44,7 +44,18 @@ print(f"GROQ: {bool(GROQ_API_KEY)} | Neo4j: {bool(NEO4J_URI)}")
 
 # COMMAND ----------
 
-# Celda 2: Credibilidad de fuentes
+# Celda 2a: TRUNCAR Y FORZAR RECARGA (solo ejecutar manualmente cuando se necesite)
+# Descomenta las líneas que quieras ejecutar y vuelve a comentarlas después
+
+# spark.sql(f"TRUNCATE TABLE {TBL_ARTICLES}")
+# spark.sql(f"TRUNCATE TABLE {TBL_ALERTS}")
+# spark.sql(f"TRUNCATE TABLE {TBL_ENTITIES}")
+# spark.sql(f"TRUNCATE TABLE {TBL_RELATIONS}")
+# print("Tablas truncadas")
+
+# COMMAND ----------
+
+# Celda 2b: Credibilidad de fuentes
 # Score 0.0-1.0 segun historial documentado (EEAS, Reuters Fact Check, Maldita)
 
 SOURCE_CREDIBILITY = {
@@ -450,6 +461,7 @@ for record, scores in above[:limit]:
     time.sleep(2)
 
 print(f"Alerts: {len(alerts_to_save)} | Entities: {len(entities_to_save)}")
+print(f"entities_to_save sample: {entities_to_save[:2] if entities_to_save else 'EMPTY'}")
 
 # COMMAND ----------
 
