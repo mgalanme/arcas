@@ -7,6 +7,7 @@
 #   - Nuevas señales: análisis de contratos BOE por importe y adjudicatario
 
 # COMMAND ----------
+
 # Celda 1: Imports y configuración
 
 import requests, json, hashlib, re, logging, time
@@ -25,6 +26,11 @@ except Exception:
     except Exception:
         GROQ_API_KEY = ""
 
+try:
+    NEO4J_URI = dbutils.secrets.get(scope="arcas", key="neo4j_uri")
+except Exception:
+    NEO4J_URI = dbutils.widgets.get("NEO4J_URI")
+
 GROQ_MODEL = "llama-3.3-70b-versatile"
 DB_RAW       = "arcas_raw"
 DB_PROCESSED = "arcas_processed"
@@ -34,6 +40,7 @@ TBL_ALERTS   = f"{DB_PROCESSED}.alerts"
 print(f"Config OK — GROQ key present: {bool(GROQ_API_KEY)}")
 
 # COMMAND ----------
+
 # Celda 2: Groq helper con retry
 
 def groq_invoke(prompt: str, max_tokens: int = 400, temperature: float = 0.1) -> str:
@@ -75,6 +82,7 @@ def translate_to_spanish(title: str) -> str:
 print("Groq helpers OK")
 
 # COMMAND ----------
+
 # Celda 3: Crear / migrar tablas Delta
 
 spark.sql(f"CREATE DATABASE IF NOT EXISTS {DB_RAW}")
@@ -135,6 +143,7 @@ for col, typedef in [("deep_analysis", "STRING")]:
 print("Tables ready")
 
 # COMMAND ----------
+
 # Celda 4: Fuentes
 
 HEADERS_HTTP = {
@@ -233,6 +242,7 @@ def scrape_source(name: str, url: str, language: str, is_fc: bool) -> list[dict]
 print(f"Sources defined: {len(MEDIA_SOURCES)}")
 
 # COMMAND ----------
+
 # Celda 5: Ingesta BOE
 
 BOE_API = "https://www.boe.es/datosabiertos/api/boe/sumario"
@@ -296,6 +306,7 @@ for days_back in range(3):
 print(f"BOE total: {len(boe_records)} records")
 
 # COMMAND ----------
+
 # Celda 6: Ingesta medios
 
 media_records = []
@@ -304,6 +315,7 @@ for name, url, lang, is_fc in MEDIA_SOURCES:
 print(f"Media total: {len(media_records)} records")
 
 # COMMAND ----------
+
 # Celda 7: Guardar en Delta con dedup y traducción
 
 from pyspark.sql import Row
@@ -343,6 +355,7 @@ else:
     print("No new records today.")
 
 # COMMAND ----------
+
 # Celda 8: Scoring con keywords
 
 KW_CAT_A = [
@@ -422,6 +435,7 @@ above      = [(r, s) for r, s in scored if max(s.values()) >= THRESHOLD]
 print(f"Candidates: {len(candidates)} | Above threshold ({THRESHOLD}): {len(above)}")
 
 # COMMAND ----------
+
 # Celda 9: Análisis profundo de corrupción con Groq
 # Para los candidatos que superan el umbral, se obtiene el snippet del artículo
 # y se hace una segunda llamada a Groq que analiza el contenido real,
@@ -516,6 +530,7 @@ for record, scores in above[:limit]:
 print(f"\nAlerts generated: {len(alerts_to_save)}")
 
 # COMMAND ----------
+
 # Celda 10: Guardar alertas
 
 if alerts_to_save:
