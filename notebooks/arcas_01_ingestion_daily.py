@@ -1,20 +1,16 @@
 # Databricks notebook source
-# ARCAS - 01_ingestion_daily v7
-# Cambios v7 (FIX RENDIMIENTO - foco celda 9 y pipeline completo):
-#   - Deduplicación SIN .collect() de TODO el histórico: Spark left_anti join sobre content_hash.
-#     Solo se hace .collect() de los registros NUEVOS del día (normalmente <100).
-#   - Traducción (title_es) y clasificación de topic en BATCH (1-4 llamadas Groq en vez de N).
-#     Prompt único con múltiples artículos + parseo de JSON array.
-#   - Clasificador HEURÍSTICO por keywords (reutiliza espíritu de las KW del scoring) antes de LLM.
-#     Reduce llamadas LLM drásticamente para la mayoría de artículos en español.
-#   - Modelo rápido (llama-3.1-8b-instant) para translate + classify (el 70b se reserva para deep analysis).
-#   - Paralelismo controlado con ThreadPoolExecutor (respeta ~30 RPM de Groq).
-#   - Celda 8 (scrape) también paralelizada (I/O bound) → ingesta completa mucho más rápida.
-#   - Celda 11 (deep analysis) paralelizada (hasta 15 items) para reducir tiempo de alertas.
-#   - Añadidos timing por fase + logs de reducción de llamadas.
-#   - groq_invoke mejorado: soporta model override + mejor manejo de rate limits.
-#   - Mantiene 100% la misma lógica, mismas tablas Delta, mismas alertas, entidades, Neo4j y salida que v6.
-#   - Total: de O(N) llamadas secuenciales + full table collect → O(1) llamadas batch + trabajo distribuido Spark.
+# ARCAS - 01_ingestion_daily v8
+# Cambios v8 (FIXES a los problemas de batching reportados):
+#   - Tamaño de batch MUY conservador: MAX 4 para traducción, MAX 6 para clasificación.
+#     Evita 413 Payload Too Large completamente.
+#   - Chunks automáticos + fallback por chunk a llamadas individuales cuando falla el parse JSON.
+#   - Parser JSON robusto (_safe_json_loads): extrae substring [ ... ], quita ```, intenta limpiar.
+#   - Detección explícita de 413 en groq_invoke → señal "__PAYLOAD_TOO_LARGE__" para reducir batch.
+#   - Más sleeps entre batches (1.5s) + backoff mejorado en 429.
+#   - Heurística más agresiva para reducir items que llegan a LLM.
+#   - Prompts más cortos y estrictos ("SOLO JSON array, nada más").
+#   - Mantiene todas las mejoras de rendimiento de v7 (dedup Spark, parallel scrape, parallel deep analysis, MERGE, fast model).
+#   - v8 es la versión estable recomendada para producción en Databricks.
 
 # COMMAND ----------
 # Celda 1: Imports y configuracion
@@ -91,6 +87,10 @@ TOPIC_KEYWORDS = {
     ],
 }
 
+# Batch sizes muy conservadores para evitar 413 y prompts demasiado grandes
+MAX_BATCH_SIZE_TRANSLATE = 4
+MAX_BATCH_SIZE_CLASSIFY = 6
+
 print(f"GROQ: {bool(GROQ_API_KEY)} | Neo4j: {bool(NEO4J_URI)} | Fast model: {GROQ_FAST_MODEL}")
 
 # COMMAND ----------
@@ -122,10 +122,10 @@ def get_credibility(source): return SOURCE_CREDIBILITY.get(source, 0.60)
 print("Credibility OK")
 
 # COMMAND ----------
-# Celda 4: Groq helpers (mejorados v7)
+# Celda 4: Groq helpers v8 (batch pequeño + robusto)
 
 def groq_invoke(prompt, max_tokens=500, temperature=0.1, model=None):
-    """Llamada a Groq con reintentos y soporte de modelo override (fast vs quality)."""
+    """Llamada a Groq con reintentos, soporte de modelo y detección de 413."""
     model = model or GROQ_MODEL
     for attempt in range(4):
         try:
@@ -136,22 +136,25 @@ def groq_invoke(prompt, max_tokens=500, temperature=0.1, model=None):
                 json={"model": model,
                       "messages":[{"role":"user","content":prompt}],
                       "max_tokens":max_tokens,"temperature":temperature},
-                timeout=45,
+                timeout=50,
             )
             if r.status_code == 429:
                 wait = 15 * (attempt + 1)
                 log.warning(f"Groq 429 - waiting {wait}s (attempt {attempt+1})")
                 time.sleep(wait)
                 continue
+            if r.status_code == 413:
+                log.warning("Groq 413 Payload Too Large - señal para usar batch más pequeño")
+                return "__PAYLOAD_TOO_LARGE__"
             r.raise_for_status()
             return r.json()["choices"][0]["message"]["content"].strip()
         except Exception as e:
             log.warning(f"Groq {attempt+1}/{4} ({model}): {e}")
-            time.sleep(4 + attempt * 2)
+            time.sleep(5 + attempt * 2)
     return ""
 
 def translate_to_spanish(title):
-    """Individual (fallback)."""
+    """Individual (fallback seguro)."""
     markers = ["el ","la ","los ","las ","de ","del ","en ","por ","que ","con "]
     if any(m in title.lower() for m in markers): return title
     r = groq_invoke(f"Traduce al espanol solo el titular:\n{title}",
@@ -159,20 +162,51 @@ def translate_to_spanish(title):
     return r if r else title
 
 def classify_topic(title, snippet=""):
-    """Individual (fallback)."""
-    prompt = f"""Clasifica este articulo periodistico en UNA de estas categorias:
+    """Individual (fallback seguro)."""
+    prompt = f"""Clasifica este articulo en UNA categoria:
 POLITICA, JUDICIAL, ECONOMIA, SALUD, DESINFORMACION, PSEUDOCIENCIA, OTRO
 
-Responde SOLO con la palabra de la categoria, sin explicaciones.
+Responde SOLO la palabra.
 
-Titular: {title}
-Contenido: {snippet[:200] if snippet else ""}"""
-    result = groq_invoke(prompt, max_tokens=10, temperature=0.0, model=GROQ_FAST_MODEL)
+Titular: {title}"""
+    result = groq_invoke(prompt, max_tokens=8, temperature=0.0, model=GROQ_FAST_MODEL)
     result = result.strip().upper().split()[0] if result else "OTRO"
     return result if result in VALID_TOPICS else "OTRO"
 
+def _chunk(lst, n):
+    """Yield successive n-sized chunks."""
+    for i in range(0, len(lst), n):
+        yield lst[i:i + n]
+
+def _safe_json_loads(text):
+    """Extractor robusto de array JSON para respuestas de LLM (maneja unterminated strings y wrappers)."""
+    if not text or not isinstance(text, str):
+        return None
+    t = text.strip()
+    # Quitar fences de markdown
+    t = re.sub(r'^```(?:json)?\s*', '', t, flags=re.IGNORECASE | re.MULTILINE)
+    t = re.sub(r'\s*```$', '', t, flags=re.MULTILINE)
+    t = t.strip()
+    # Extraer el primer [ ... ] completo
+    start = t.find('[')
+    end = t.rfind(']')
+    if start != -1 and end != -1 and end > start:
+        candidate = t[start:end+1]
+    else:
+        candidate = t
+    try:
+        return json.loads(candidate)
+    except Exception:
+        # Segundo intento: colapsar whitespace
+        try:
+            candidate2 = re.sub(r'\s+', ' ', candidate)
+            return json.loads(candidate2)
+        except Exception as e2:
+            log.debug(f"JSON still failing: {str(e2)[:80]} | preview: {candidate[:150]}...")
+            return None
+
 def heuristic_classify(title, snippet="", source_name="", is_fc=False):
-    """Clasificación rápida por keywords (sin LLM)."""
+    """Clasificación rápida por keywords (sin LLM). Muy agresiva en v8."""
     text = f"{title or ''} {snippet or ''}".lower()
     best_topic = "OTRO"
     best_score = 0
@@ -181,54 +215,70 @@ def heuristic_classify(title, snippet="", source_name="", is_fc=False):
         if sc > best_score:
             best_score = sc
             best_topic = topic
-    # Bias para fact-checkers de desinfo/pseudo
-    if is_fc and best_topic not in ("DESINFORMACION", "PSEUDOCIENCIA"):
-        if any(kw in text for kw in TOPIC_KEYWORDS["DESINFORMACION"][:6]):
+    # Bias fuerte para fact-checkers
+    if is_fc:
+        if any(kw in text for kw in TOPIC_KEYWORDS.get("DESINFORMACION", [])[:8]):
             best_topic = "DESINFORMACION"
-        elif any(kw in text for kw in TOPIC_KEYWORDS["PSEUDOCIENCIA"][:6]):
+        elif any(kw in text for kw in TOPIC_KEYWORDS.get("PSEUDOCIENCIA", [])[:8]):
             best_topic = "PSEUDOCIENCIA"
     return best_topic if best_score >= 1 else None
 
 def translate_titles_batch(records):
-    """Traduce múltiples títulos en 1-2 llamadas Groq (JSON batch)."""
+    """Traduce en batches PEQUEÑOS (max 4). Seguro contra 413 y parse errors."""
     to_translate = [r for r in records if r.get("language") != "es" and not r.get("title_es")]
     if not to_translate:
         return 0
-    if len(to_translate) <= 2:
-        for r in to_translate:
-            r["title_es"] = translate_to_spanish(r["title"])
-        return len(to_translate)
 
-    lines = [f'{i}: {r.get("title","")}' for i, r in enumerate(to_translate)]
-    prompt = f"""Traduce al español SOLO los siguientes titulares periodísticos.
-Responde EXCLUSIVAMENTE un JSON array válido SIN explicaciones:
-[{{"idx": 0, "title_es": "..."}}, ...]
+    total_llm_calls = 0
+    for chunk in _chunk(to_translate, MAX_BATCH_SIZE_TRANSLATE):
+        if len(chunk) <= 1:
+            for r in chunk:
+                r["title_es"] = translate_to_spanish(r["title"])
+            total_llm_calls += 1
+            time.sleep(1.2)
+            continue
 
-Titulares:
-""" + "\n".join(lines)
+        # Prompt compacto
+        lines = [f'{i}: {r.get("title","")[:95]}' for i, r in enumerate(chunk)]
+        prompt = (
+            "Traduce al español SOLO los siguientes titulares. "
+            "Responde EXCLUSIVAMENTE un JSON array válido, sin explicaciones ni markdown:\n"
+            "[{\"idx\":0,\"title_es\":\"...\"}, ...]\n\n" + "\n".join(lines)
+        )
 
-    resp = groq_invoke(prompt, max_tokens=600, temperature=0.0, model=GROQ_FAST_MODEL)
-    try:
-        clean = re.sub(r"```json|```", "", resp or "").strip()
-        arr = json.loads(clean)
-        mapping = {}
-        for x in (arr or []):
-            try:
-                mapping[int(x.get("idx", -1))] = (x.get("title_es") or "").strip()
-            except Exception:
-                pass
-        for i, r in enumerate(to_translate):
-            r["title_es"] = mapping.get(i) or r.get("title", "")
-        log.info(f"  Batch translate OK: {len(to_translate)} titles in 1 call")
-        return 1  # 1 LLM call
-    except Exception as e:
-        log.warning(f"Batch translate parse failed, fallback individual: {e}")
-        for r in to_translate:
-            r["title_es"] = translate_to_spanish(r["title"])
-        return len(to_translate)  # worst case
+        resp = groq_invoke(prompt, max_tokens=280, temperature=0.0, model=GROQ_FAST_MODEL)
+        total_llm_calls += 1
+
+        if resp == "__PAYLOAD_TOO_LARGE__":
+            log.warning("413 en translate batch - fallback individual del chunk")
+            for r in chunk:
+                r["title_es"] = translate_to_spanish(r["title"])
+            time.sleep(2)
+            continue
+
+        parsed = _safe_json_loads(resp)
+        if parsed and isinstance(parsed, list):
+            mapping = {}
+            for x in parsed:
+                if isinstance(x, dict):
+                    try:
+                        idx = int(x.get("idx", -1))
+                        mapping[idx] = (x.get("title_es") or "").strip()
+                    except Exception:
+                        pass
+            for i, r in enumerate(chunk):
+                r["title_es"] = mapping.get(i) or r.get("title", "")
+        else:
+            log.warning("Batch translate parse failed, fallback individual")
+            for r in chunk:
+                r["title_es"] = translate_to_spanish(r["title"])
+
+        time.sleep(1.5)  # respiración para rate limit
+
+    return total_llm_calls
 
 def classify_topics_batch(records, use_heuristic=True):
-    """Clasifica múltiples artículos con heurística + 1 batch LLM si hace falta."""
+    """Clasifica en batches PEQUEÑOS (max 6). Heurística primero + robustez."""
     if not records:
         return 0
 
@@ -252,49 +302,67 @@ def classify_topics_batch(records, use_heuristic=True):
         to_classify.append(r)
 
     if not to_classify:
-        log.info(f"  Heuristic classified {heuristic_hits} (no LLM needed)")
+        if heuristic_hits:
+            log.info(f"  Heuristic classified {heuristic_hits} (sin LLM)")
         return 0
 
-    # Batch LLM para los que quedan
-    lines = []
-    for i, r in enumerate(to_classify):
-        ttl = (r.get("title_es") or r.get("title", ""))[:180]
-        sn  = (r.get("content_snippet") or "")[:120]
-        lines.append(f'{i}: Título: {ttl} | Snippet: {sn}')
-
-    prompt = f"""Clasifica CADA artículo periodístico en EXACTAMENTE UNA de estas categorías:
-{', '.join(VALID_TOPICS)}
-
-Responde SOLO un JSON array válido (sin texto extra):
-[{{"idx": 0, "topic": "POLITICA"}}, {{"idx": 1, "topic": "JUDICIAL"}}, ...]
-
-Artículos a clasificar:
-""" + "\n".join(lines)
-
-    resp = groq_invoke(prompt, max_tokens=400, temperature=0.0, model=GROQ_FAST_MODEL)
-    llm_calls = 1
-    try:
-        clean = re.sub(r"```json|```", "", resp or "").strip()
-        arr = json.loads(clean)
-        idx_map = {}
-        for x in (arr or []):
-            try:
-                idx = int(x.get("idx", -1))
-                t = str(x.get("topic", "OTRO")).upper().strip()
-                idx_map[idx] = t if t in VALID_TOPICS else "OTRO"
-            except Exception:
-                pass
-        for i, r in enumerate(to_classify):
-            r["topic"] = idx_map.get(i, "OTRO")
-        log.info(f"  Batch classify: {heuristic_hits} heuristic + {len(to_classify)} via 1 LLM call")
-    except Exception as e:
-        log.warning(f"Batch classify parse failed ({e}), fallback to individual calls")
-        for r in to_classify:
+    total_llm_calls = 0
+    for chunk in _chunk(to_classify, MAX_BATCH_SIZE_CLASSIFY):
+        if len(chunk) == 0:
+            continue
+        if len(chunk) == 1:
+            r = chunk[0]
             r["topic"] = classify_topic(r.get("title_es") or r.get("title", ""), r.get("content_snippet", ""))
-        llm_calls = len(to_classify)  # worst
-    return llm_calls
+            total_llm_calls += 1
+            time.sleep(1)
+            continue
 
-print("Groq helpers v7 (batch + heuristic + fast model) OK")
+        lines = []
+        for i, r in enumerate(chunk):
+            ttl = (r.get("title_es") or r.get("title", ""))[:90]
+            lines.append(f'{i}: {ttl}')
+
+        prompt = (
+            "Clasifica cada artículo en EXACTAMENTE UNA de: " + ", ".join(VALID_TOPICS) + ".\n"
+            "Responde SOLO JSON array: [{\"idx\":0,\"topic\":\"POLITICA\"}, ...]. Nada más.\n\n"
+            + "\n".join(lines)
+        )
+
+        resp = groq_invoke(prompt, max_tokens=220, temperature=0.0, model=GROQ_FAST_MODEL)
+        total_llm_calls += 1
+
+        if resp == "__PAYLOAD_TOO_LARGE__":
+            log.warning("413 en classify batch - fallback individual del chunk")
+            for r in chunk:
+                r["topic"] = classify_topic(r.get("title_es") or r.get("title", ""), r.get("content_snippet", ""))
+            time.sleep(2)
+            continue
+
+        parsed = _safe_json_loads(resp)
+        if parsed and isinstance(parsed, list):
+            idx_map = {}
+            for x in parsed:
+                if isinstance(x, dict):
+                    try:
+                        idx = int(x.get("idx", -1))
+                        t = str(x.get("topic", "OTRO")).upper().strip()
+                        idx_map[idx] = t if t in VALID_TOPICS else "OTRO"
+                    except Exception:
+                        pass
+            for i, r in enumerate(chunk):
+                r["topic"] = idx_map.get(i, "OTRO")
+        else:
+            log.warning("Batch classify parse failed, fallback individual")
+            for r in chunk:
+                r["topic"] = classify_topic(r.get("title_es") or r.get("title", ""), r.get("content_snippet", ""))
+
+        time.sleep(1.5)
+
+    if heuristic_hits or total_llm_calls:
+        log.info(f"  Classify: {heuristic_hits} heuristic + ~{total_llm_calls} LLM calls (batches de <=6)")
+    return total_llm_calls
+
+print("Groq helpers v8 (batches pequeños + JSON robusto + 413 handling) OK")
 
 # COMMAND ----------
 # Celda 5: Crear / migrar tablas Delta
@@ -343,7 +411,7 @@ print("Tables ready")
 # Celda 6: Fuentes — medios + fact-checkers + pseudociencias/salud
 
 HEADERS_HTTP = {
-    "User-Agent":"Mozilla/5.0 (compatible; ARCAS-Research/7.0)",
+    "User-Agent":"Mozilla/5.0 (compatible; ARCAS-Research/8.0)",
     "Accept-Language":"es-ES,es;q=0.9,en;q=0.8",
 }
 
@@ -468,10 +536,10 @@ for days_back in range(3):
 print(f"BOE (contraste): {len(boe_records)}")
 
 # COMMAND ----------
-# Celda 8: Ingesta medios (PARALELIZADA v7 - mucho más rápida)
+# Celda 8: Ingesta medios (PARALELIZADA v8)
 
 def scrape_all_parallel(sources, max_workers=7):
-    """Ejecuta scrape_source en paralelo (I/O-bound). Respeta el mismo contrato."""
+    """Ejecuta scrape_source en paralelo (I/O-bound)."""
     results = []
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_src = {
@@ -492,7 +560,7 @@ media_records = scrape_all_parallel(MEDIA_SOURCES)
 print(f"Media (parallel): {len(media_records)} in {time.time()-t_scrape:.1f}s")
 
 # COMMAND ----------
-# Celda 9: Guardar en Delta con dedup, traduccion y clasificacion de topic (REFACTORIZADA v7)
+# Celda 9: Guardar en Delta con dedup, traduccion y clasificacion de topic (v8 estable)
 
 from pyspark.sql import Row
 from pyspark.sql.functions import current_timestamp
@@ -502,22 +570,19 @@ all_records = boe_records + media_records
 
 new_records = []
 if all_records:
-    # Creamos DF de candidatos (driver solo maneja los del día actual)
     cand_rows = [Row(**r) for r in all_records]
     cand_df = spark.createDataFrame(cand_rows)
 
-    # Anti-join distribuido en Spark: NO hacemos collect de millones de hashes
     existing_hashes = spark.table(TBL_ARTICLES).select("content_hash").distinct()
     new_df = cand_df.join(existing_hashes, on="content_hash", how="left_anti")
 
-    # Solo recolectamos los NUEVOS (casi siempre decenas, no cientos de miles)
     new_records = [r.asDict() for r in new_df.collect()]
 
-print(f"New: {len(new_records)} (dedup via Spark left_anti join - sin full collect histórico)")
+print(f"New: {len(new_records)} (dedup via Spark left_anti join)")
 
 llm_calls_estimate = 0
 if new_records and GROQ_API_KEY:
-    # 1. Traducciones en batch (títulos en inglés)
+    # 1. Traducciones (batches pequeños)
     t_tr = time.time()
     eng = [r for r in new_records if r.get("language") != "es"]
     calls_tr = translate_titles_batch(eng)
@@ -527,17 +592,15 @@ if new_records and GROQ_API_KEY:
             r["title_es"] = r.get("title", "")
     print(f"  Translations: {len(eng)} items, ~{calls_tr} LLM call(s) in {time.time()-t_tr:.1f}s")
 
-    # 2. Clasificación de topic: heurística + batch LLM
+    # 2. Clasificación (heurística + batches pequeños)
     t_cl = time.time()
     media_new = [r for r in new_records if r.get("source_type") != "gazette"]
-    print(f"Classifying topics for {len(media_new)} media articles (heuristic-first + batched LLM)...")
+    print(f"Classifying topics for {len(media_new)} media (heuristic + small batches <=6)...")
     calls_cl = classify_topics_batch(media_new, use_heuristic=True)
     llm_calls_estimate += calls_cl
-    # BOE ya trae topic="OFICIAL"
-    print(f"  Topics done in {time.time()-t_cl:.1f}s (heuristic + ~{calls_cl} LLM call(s))")
+    print(f"  Topics done in {time.time()-t_cl:.1f}s")
 
 if new_records:
-    # Aseguramos campos obligatorios por si algún record viene incompleto
     for r in new_records:
         r.setdefault("title_es", r.get("title", ""))
         r.setdefault("topic", "OTRO" if r.get("source_type") != "gazette" else "OFICIAL")
@@ -546,7 +609,6 @@ if new_records:
     df_new = spark.createDataFrame([Row(**r) for r in new_records])
     df_new = df_new.withColumn("ingested_at", current_timestamp())
 
-    # Usamos MERGE para escritura idempotente (mejor práctica Delta + dedup extra)
     df_new.createOrReplaceTempView("new_enriched")
     spark.sql(f"""
         MERGE INTO {TBL_ARTICLES} t
@@ -556,7 +618,7 @@ if new_records:
     """)
     print(f"Merged {len(new_records)} new articles into Delta (idempotent)")
 
-print(f"Celda 9 total: {time.time()-t9:.1f}s | LLM calls estimadas para enriquecimiento: ~{llm_calls_estimate} (vs N en v6)")
+print(f"Celda 9 total: {time.time()-t9:.1f}s | LLM calls: ~{llm_calls_estimate} (batches muy pequeños)")
 
 # COMMAND ----------
 # Celda 10: Scoring — SOLO medios/fact-checkers, ampliado con pseudociencias
@@ -627,7 +689,7 @@ for r,s in scored:
 print(f"Media candidates: {len(media_candidates)} | Above threshold: {len(above)}")
 
 # COMMAND ----------
-# Celda 11: Analisis profundo (PARALELIZADO v7)
+# Celda 11: Analisis profundo (PARALELIZADO v8)
 
 import uuid
 from datetime import datetime
@@ -680,7 +742,7 @@ SOLO JSON. Formato: {{"personas":[],"organismos":[],"casos":[],"partidos":[]}}
 Texto: {text}"""
 
 def _process_one_for_alert(record, scores):
-    """Procesa un candidato: deep analysis + entities. Devuelve (alert_dict, list_entities)."""
+    """Procesa un candidato: deep analysis + entities."""
     cat       = top_cat(scores)
     base_conf = max(scores.values())
     title_es  = record.get("title_es") or record.get("title","")
@@ -756,7 +818,7 @@ if above and limit > 0:
             except Exception as e:
                 log.warning(f"Alert processing error: {e}")
 
-print(f"Alerts: {len(alerts_to_save)} | Entities: {len(entities_to_save)} (parallel deep analysis in {time.time()-t11:.1f}s)")
+print(f"Alerts: {len(alerts_to_save)} | Entities: {len(entities_to_save)} (parallel in {time.time()-t11:.1f}s)")
 
 # COMMAND ----------
 # Celda 12: Guardar alertas y entidades en Delta
@@ -817,11 +879,11 @@ tal  = spark.sql(f"SELECT count(*) AS n FROM {TBL_ALERTS}").collect()[0]["n"]
 pen  = spark.sql(f"SELECT count(*) AS n FROM {TBL_ALERTS} WHERE status='pending'").collect()[0]["n"]
 te   = spark.sql(f"SELECT count(*) AS n FROM {TBL_ENTITIES}").collect()[0]["n"]
 
-print(f"\n=== ARCAS Daily Run v7 (rendimiento optimizado) ===")
+print(f"\n=== ARCAS Daily Run v8 (batch seguro + robusto) ===")
 print(f"Articulos medios:    {tm}")
 print(f"Articulos totales:   {ta} (incl. BOE contraste)")
 print(f"Alertas totales:     {tal}")
 print(f"Pendientes:          {pen}")
 print(f"Entidades grafo:     {te}")
 print("====================================================")
-print("Notas v7: dedup distribuido + batch LLM (translate/classify) + heuristic + parallel scraping & analysis.")
+print("Notas v8: batches max 4-6 + JSON robusto + manejo 413 + heurística fuerte.")
