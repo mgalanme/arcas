@@ -157,15 +157,33 @@ def trigger_job(extra_params={}):
         payload = {"job_id": int(DATABRICKS_JOB_ID)}
         if extra_params:
             payload["job_parameters"] = extra_params
-        r = requests.post(
-            f"{DATABRICKS_HOST}/api/2.1/jobs/run-now",
-            headers={"Authorization": f"Bearer {DATABRICKS_TOKEN}",
-                     "Content-Type": "application/json"},
+        r=requests.post(f"{DATABRICKS_HOST}/api/2.1/jobs/run-now",
+            headers={"Authorization":f"Bearer {DATABRICKS_TOKEN}","Content-Type":"application/json"},
             json=payload, timeout=15)
         r.raise_for_status()
-        return True, str(r.json().get("run_id", "?"))
-    except Exception as e:
-        return False, str(e)
+        return True,str(r.json().get("run_id","?"))
+    except Exception as e: return False,str(e)
+
+def get_run_status(run_id: str) -> dict:
+    """Consulta el estado de una ejecucion del Job en Databricks."""
+    try:
+        r = requests.get(
+            f"{DATABRICKS_HOST}/api/2.1/jobs/runs/get",
+            headers={"Authorization": f"Bearer {DATABRICKS_TOKEN}"},
+            params={"run_id": run_id},
+            timeout=10,
+        )
+        r.raise_for_status()
+        data = r.json()
+        state = data.get("state", {})
+        return {
+            "life_cycle": state.get("life_cycle_state", "UNKNOWN"),
+            "result":     state.get("result_state", ""),
+            "start_time": data.get("start_time", 0),
+            "end_time":   data.get("end_time", 0),
+        }
+    except Exception:
+        return {"life_cycle": "UNKNOWN", "result": "", "start_time": 0, "end_time": 0}
 
 def validate_email(e):
     return bool(re.match(r"^[\w\.\+\-]+@[\w\-]+\.[a-z]{2,}$",e.strip(),re.IGNORECASE))
@@ -226,7 +244,7 @@ st.markdown(f"""<div class="arcas-header">
 
 # ══ RECARGAR ══════════════════════════════════════════════════════════════════
 if page=="🔄 Recargar información":
-    st.markdown('<div class="section-rule">Actualización de fuentes</div>',unsafe_allow_html=True)
+    st.markdown('<div class="section-rule">Actualización de fuentes</div>', unsafe_allow_html=True)
     st.markdown("El sistema analiza automáticamente las noticias cada día a las **09:30**. Si necesitas analizar noticias de ahora mismo, usa el botón.")
 
     truncar = st.checkbox(
@@ -243,28 +261,104 @@ if page=="🔄 Recargar información":
         if not confirmacion_ok and confirmacion.strip():
             st.error("El texto no coincide. Escribe exactamente: CONFIRMAR")
 
-    col_btn,col_info=st.columns([1,2])
+    col_btn, col_info = st.columns([1, 2])
     with col_btn:
         boton_label = "🔄 Vaciar y recargar" if truncar else "🔄 Analizar noticias ahora"
         if st.button(boton_label, use_container_width=True, disabled=(truncar and not confirmacion_ok)):
-            with st.spinner("Lanzando análisis..."):
-                job_params = {"TRUNCATE_TABLES": "true"} if truncar else {}
-                ok,result=trigger_job(job_params)
+            inicio = datetime.now()
+            job_params = {"TRUNCATE_TABLES": "true"} if truncar else {}
+            ok, run_id = trigger_job(job_params)
             if ok:
-                msg = "Proceso iniciado con vaciado de tablas." if truncar else "Proceso iniciado."
-                st.success(f"{msg} En unos minutos verás nuevas alertas. (ID: {result})")
+                st.session_state["run_id"]    = run_id
+                st.session_state["run_inicio"] = inicio
+                msg = "con vaciado de tablas" if truncar else "incremental"
+                st.success(f"Proceso iniciado ({msg}). ID: {run_id}")
             else:
-                st.error(f"No se pudo iniciar: {result}")
+                st.error(f"No se pudo iniciar: {run_id}")
+
+    # Panel de seguimiento si hay un run activo
+    if st.session_state.get("run_id"):
+        run_id    = st.session_state["run_id"]
+        inicio    = st.session_state.get("run_inicio", datetime.now())
+        status    = get_run_status(run_id)
+        lc        = status["life_cycle"]
+        result    = status["result"]
+        ahora     = datetime.now()
+        duracion  = int((ahora - inicio).total_seconds())
+        mm, ss    = divmod(duracion, 60)
+
+        ESTADO_ES = {
+            "PENDING":    ("⏳ En cola...",         "#8B6914"),
+            "RUNNING":    ("⚙️ Ejecutándose...",    "#1a5276"),
+            "TERMINATING":("⚙️ Finalizando...",     "#1a5276"),
+            "TERMINATED": ("✅ Completado",          "#1a7a4a"),
+            "SKIPPED":    ("⏭️ Omitido",             "#888"),
+            "INTERNAL_ERROR": ("❌ Error interno",  "#c0392b"),
+            "UNKNOWN":    ("❓ Desconocido",         "#888"),
+        }
+        etiqueta, color = ESTADO_ES.get(lc, (lc, "#888"))
+        if lc == "TERMINATED" and result not in ("SUCCESS", ""):
+            etiqueta, color = f"❌ Fallido ({result})", "#c0392b"
+
+        # Calcular duración real desde Databricks si ya terminó
+        if lc == "TERMINATED" and status["start_time"] and status["end_time"]:
+            dur_real = int((status["end_time"] - status["start_time"]) / 1000)
+            mm2, ss2 = divmod(dur_real, 60)
+            dur_str  = f"{mm2}m {ss2}s"
+        else:
+            dur_str  = f"{mm}m {ss}s (en curso)"
+
+        st.markdown(f"""
+        <div style="background:#fff;border:1px solid #ddd8ce;border-left:4px solid {color};
+                    padding:1rem 1.5rem;border-radius:2px;margin-top:1rem;">
+            <div style="font-family:'JetBrains Mono',monospace;font-size:0.65rem;
+                        color:#888;text-transform:uppercase;letter-spacing:0.08em;">
+                Estado del proceso · Run {run_id}
+            </div>
+            <div style="font-size:1.2rem;font-weight:700;color:{color};margin-top:0.3rem;">
+                {etiqueta}
+            </div>
+            <div style="font-size:0.8rem;color:#888;margin-top:0.2rem;">
+                Inicio: {inicio.strftime("%d/%m/%Y %H:%M:%S")} · Duración: {dur_str}
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        if lc in ("PENDING", "RUNNING", "TERMINATING"):
+            if st.button("🔃 Actualizar estado", key="refresh_status"):
+                st.rerun()
+        elif lc == "TERMINATED":
+            if st.button("✖ Cerrar seguimiento", key="clear_run"):
+                del st.session_state["run_id"]
+                del st.session_state["run_inicio"]
+                st.rerun()
+
     with col_info:
-        df_last=qry("SELECT max(ingested_at) AS ultima,count(*) AS total FROM arcas_raw.articles WHERE source_type!='gazette'")
+        df_last = qry("SELECT max(ingested_at) AS ultima, count(*) AS total FROM arcas_raw.articles WHERE source_type!='gazette'")
         if not df_last.empty and df_last["ultima"].iloc[0]:
-            ultima=str(df_last["ultima"].iloc[0])[:19].replace("T"," ")
-            total=int(df_last["total"].iloc[0])
-            st.markdown(f"""<div style="background:#fff;border:1px solid #ddd8ce;padding:1rem 1.3rem;border-radius:2px;">
-                <div style="font-family:'JetBrains Mono',monospace;font-size:0.65rem;color:#888;text-transform:uppercase;letter-spacing:0.08em;">Última recarga</div>
+            ts = df_last["ultima"].iloc[0]
+            try:
+                from datetime import timezone as tz
+                if hasattr(ts, "strftime"):
+                    ultima = ts.strftime("%d/%m/%Y %H:%M:%S")
+                else:
+                    ultima = str(ts)[:19].replace("T", " ")
+                    partes = ultima.split(" ")
+                    if len(partes) == 2:
+                        d, t = partes
+                        y, mo, dy = d.split("-")
+                        ultima = f"{dy}/{mo}/{y} {t}"
+            except Exception:
+                ultima = str(ts)[:19]
+            total = int(df_last["total"].iloc[0])
+            st.markdown(f"""
+            <div style="background:#fff;border:1px solid #ddd8ce;padding:1rem 1.3rem;border-radius:2px;">
+                <div style="font-family:'JetBrains Mono',monospace;font-size:0.65rem;color:#888;
+                            text-transform:uppercase;letter-spacing:0.08em;">Última recarga</div>
                 <div style="font-size:1.1rem;font-weight:600;color:#0d0d0d;margin-top:0.2rem;">{ultima}</div>
                 <div style="font-size:0.8rem;color:#888;font-style:italic;">{total:,} noticias almacenadas</div>
-            </div>""",unsafe_allow_html=True)
+            </div>
+            """, unsafe_allow_html=True)
 # ══ CUADRO DE MANDOS ══════════════════════════════════════════════════════════
 elif page=="📊 Cuadro de mandos":
     st.markdown('<div class="section-rule">Actividad por día</div>',unsafe_allow_html=True)
