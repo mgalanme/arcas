@@ -13,6 +13,7 @@
 #   - v8 es la versión estable recomendada para producción en Databricks.
 
 # COMMAND ----------
+
 # Celda 1: Imports y configuracion
 
 import requests, json, hashlib, re, logging, time
@@ -94,6 +95,7 @@ MAX_BATCH_SIZE_CLASSIFY = 6
 print(f"GROQ: {bool(GROQ_API_KEY)} | Neo4j: {bool(NEO4J_URI)} | Fast model: {GROQ_FAST_MODEL}")
 
 # COMMAND ----------
+
 # Celda 2: TRUNCAR (solo uso manual excepcional)
 
 # spark.sql(f"TRUNCATE TABLE {TBL_ARTICLES}")
@@ -103,6 +105,7 @@ print(f"GROQ: {bool(GROQ_API_KEY)} | Neo4j: {bool(NEO4J_URI)} | Fast model: {GRO
 # print("Truncado completo")
 
 # COMMAND ----------
+
 # Celda 3: Credibilidad de fuentes
 
 SOURCE_CREDIBILITY = {
@@ -122,6 +125,7 @@ def get_credibility(source): return SOURCE_CREDIBILITY.get(source, 0.60)
 print("Credibility OK")
 
 # COMMAND ----------
+
 # Celda 4: Groq helpers v8 (batch pequeño + robusto)
 
 def groq_invoke(prompt, max_tokens=500, temperature=0.1, model=None):
@@ -365,6 +369,7 @@ def classify_topics_batch(records, use_heuristic=True):
 print("Groq helpers v8 (batches pequeños + JSON robusto + 413 handling) OK")
 
 # COMMAND ----------
+
 # Celda 5: Crear / migrar tablas Delta
 
 spark.sql(f"CREATE DATABASE IF NOT EXISTS {DB_RAW}")
@@ -408,6 +413,7 @@ for tbl, col, td in [
 print("Tables ready")
 
 # COMMAND ----------
+
 # Celda 6: Fuentes — medios + fact-checkers + pseudociencias/salud
 
 HEADERS_HTTP = {
@@ -497,6 +503,7 @@ def scrape_source(name, url, language, is_fc):
 print(f"Sources: {len(MEDIA_SOURCES)}")
 
 # COMMAND ----------
+
 # Celda 7: Ingesta BOE (solo contraste)
 
 def fetch_boe(pub_date):
@@ -536,6 +543,7 @@ for days_back in range(3):
 print(f"BOE (contraste): {len(boe_records)}")
 
 # COMMAND ----------
+
 # Celda 8: Ingesta medios (PARALELIZADA v8)
 
 def scrape_all_parallel(sources, max_workers=7):
@@ -560,6 +568,7 @@ media_records = scrape_all_parallel(MEDIA_SOURCES)
 print(f"Media (parallel): {len(media_records)} in {time.time()-t_scrape:.1f}s")
 
 # COMMAND ----------
+
 # Celda 9: Guardar en Delta con dedup, traduccion y clasificacion de topic (v8 estable)
 
 from pyspark.sql import Row
@@ -606,21 +615,34 @@ if new_records:
         r.setdefault("topic", "OTRO" if r.get("source_type") != "gazette" else "OFICIAL")
         r.setdefault("content_snippet", "")
 
-    df_new = spark.createDataFrame([Row(**r) for r in new_records])
-    df_new = df_new.withColumn("ingested_at", current_timestamp())
+# Columnas exactas de TBL_ARTICLES (sin deep_analysis ni ninguna extra)
+ARTICLE_COLS = [
+    "source_type", "source_name", "title", "title_es",
+    "content_url", "content_snippet", "pub_date", "language",
+    "jurisdiction", "content_hash", "is_factchecker", "topic"
+]
 
-    df_new.createOrReplaceTempView("new_enriched")
-    spark.sql(f"""
-        MERGE INTO {TBL_ARTICLES} t
-        USING new_enriched n
-        ON t.content_hash = n.content_hash
-        WHEN NOT MATCHED THEN INSERT *
-    """)
-    print(f"Merged {len(new_records)} new articles into Delta (idempotent)")
+# Limpiar registros: solo columnas permitidas
+clean_records = [{k: r.get(k, "") for k in ARTICLE_COLS} for r in new_records]
+# Asegurar booleano correcto para is_factchecker
+for r in clean_records:
+    r["is_factchecker"] = bool(r.get("is_factchecker", False))
+
+df_new = spark.createDataFrame([Row(**r) for r in clean_records])
+df_new = df_new.withColumn("ingested_at", current_timestamp())
+
+df_new.createOrReplaceTempView("new_enriched")
+spark.sql(f"""
+    MERGE INTO {TBL_ARTICLES} t
+    USING new_enriched n
+    ON t.content_hash = n.content_hash
+    WHEN NOT MATCHED THEN INSERT *
+""")
 
 print(f"Celda 9 total: {time.time()-t9:.1f}s | LLM calls: ~{llm_calls_estimate} (batches muy pequeños)")
 
 # COMMAND ----------
+
 # Celda 10: Scoring — SOLO medios/fact-checkers, ampliado con pseudociencias
 
 KW_A=["contrato","adjudicaci","licitaci","concurso","subvencion","obra publica",
@@ -689,6 +711,7 @@ for r,s in scored:
 print(f"Media candidates: {len(media_candidates)} | Above threshold: {len(above)}")
 
 # COMMAND ----------
+
 # Celda 11: Analisis profundo (PARALELIZADO v8)
 
 import uuid
@@ -821,6 +844,7 @@ if above and limit > 0:
 print(f"Alerts: {len(alerts_to_save)} | Entities: {len(entities_to_save)} (parallel in {time.time()-t11:.1f}s)")
 
 # COMMAND ----------
+
 # Celda 12: Guardar alertas y entidades en Delta
 
 if alerts_to_save:
@@ -840,6 +864,7 @@ if entities_to_save:
     print(f"Saved {len(entities_to_save)} entities")
 
 # COMMAND ----------
+
 # Celda 13: Neo4j
 
 if NEO4J_URI and entities_to_save:
@@ -871,6 +896,7 @@ if NEO4J_URI and entities_to_save:
         log.warning(f"Neo4j failed: {ex}")
 
 # COMMAND ----------
+
 # Celda 14: Resumen
 
 ta   = spark.sql(f"SELECT count(*) AS n FROM {TBL_ARTICLES}").collect()[0]["n"]
