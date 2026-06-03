@@ -423,7 +423,7 @@ HEADERS_HTTP = {
 
 MEDIA_SOURCES = [
     # Prensa generalista
-    ("El Pais",          "https://elpais.com/espana/",                "es", False),
+   ("El Pais", "https://feeds.elpais.com/mrss-s/pages/ep/site/elpais.com/section/espana/portada", "es", False),
     ("El Mundo",         "https://www.elmundo.es/espana.html",         "es", False),
     ("ABC",              "https://www.abc.es/espana/",                 "es", False),
     ("La Vanguardia",    "https://www.lavanguardia.com/politica",      "es", False),
@@ -439,11 +439,10 @@ MEDIA_SOURCES = [
     ("Expansion",        "https://www.expansion.com/economia.html",    "es", False),
     # Fuentes judiciales y transparencia
     ("Poder Judicial",   "https://www.poderjudicial.es/cgpj/es/Poder-Judicial/Noticias-Judiciales/", "es", False),
-    ("Transparencia",    "https://www.transparencia.gob.es/transparencia/transparencia_Home/index/Mas-informacion/noticias.html", "es", False),
+   ("Transparencia", "https://www.transparencia.gob.es/transparencia/transparencia_Home/index.html", "es", False),
     ("Civio",            "https://civio.es/noticias/",                 "es", False),
     ("El Salto",         "https://www.elsaltodiario.com/politica",     "es", False),
     # Salud y pseudociencias
-    ("El Pais Salud",    "https://elpais.com/salud-y-bienestar/",      "es", False),
     ("El Mundo Salud",   "https://www.elmundo.es/ciencia-y-salud/salud.html", "es", False),
     ("El Confidencial Salud","https://www.elconfidencial.com/bienestar/", "es", False),
     ("20minutos",        "https://www.20minutos.es/ciencia/",          "es", False),
@@ -619,9 +618,9 @@ if new_records:
     for r in new_records:
         row = {k: r.get(k, "") for k in ARTICLE_COLS}
         row["is_factchecker"] = bool(r.get("is_factchecker", False))
-        row["title_es"] = row["title_es"] or row["title"]
-        row["topic"] = row["topic"] or ("OFICIAL" if row["source_type"] == "gazette" else "OTRO")
-        row["content_snippet"] = row["content_snippet"] or ""
+        row["title_es"]       = row["title_es"] or row["title"]
+        row["topic"]          = row["topic"] or ("OFICIAL" if row["source_type"] == "gazette" else "OTRO")
+        row["content_snippet"]= row["content_snippet"] or ""
         clean.append(row)
 
     df_new = spark.createDataFrame([Row(**r) for r in clean])
@@ -631,11 +630,19 @@ if new_records:
         MERGE INTO {TBL_ARTICLES} t
         USING new_enriched n
         ON t.content_hash = n.content_hash
-        WHEN NOT MATCHED THEN INSERT *
+        WHEN NOT MATCHED THEN INSERT (
+            source_type, source_name, title, title_es,
+            content_url, content_snippet, pub_date, language,
+            jurisdiction, content_hash, is_factchecker, topic, ingested_at
+        ) VALUES (
+            n.source_type, n.source_name, n.title, n.title_es,
+            n.content_url, n.content_snippet, n.pub_date, n.language,
+            n.jurisdiction, n.content_hash, n.is_factchecker, n.topic, n.ingested_at
+        )
     """)
-    print(f"Merged {len(clean)} new articles into Delta (idempotent)")
+    print(f"Merged {len(clean)} articles")
 
-print(f"Celda 9 total: {time.time()-t9:.1f}s | LLM calls: ~{llm_calls_estimate}")
+print(f"Celda 9: {time.time()-t9:.1f}s | LLM calls: ~{llm_calls_estimate}")
 
 # COMMAND ----------
 
