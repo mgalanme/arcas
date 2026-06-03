@@ -152,11 +152,14 @@ def update_alerts(ids, status):
     except Exception as e:
         st.error(str(e)); return False
 
-def trigger_job():
+def trigger_job(extra_params={}):
     try:
+        payload = {"job_id": int(DATABRICKS_JOB_ID)}
+        if extra_params:
+            payload["notebook_params"] = extra_params
         r=requests.post(f"{DATABRICKS_HOST}/api/2.1/jobs/run-now",
             headers={"Authorization":f"Bearer {DATABRICKS_TOKEN}","Content-Type":"application/json"},
-            json={"job_id":int(DATABRICKS_JOB_ID)},timeout=15)
+            json=payload, timeout=15)
         r.raise_for_status()
         return True,str(r.json().get("run_id","?"))
     except Exception as e: return False,str(e)
@@ -222,13 +225,33 @@ st.markdown(f"""<div class="arcas-header">
 if page=="🔄 Recargar información":
     st.markdown('<div class="section-rule">Actualización de fuentes</div>',unsafe_allow_html=True)
     st.markdown("El sistema analiza automáticamente las noticias cada día a las **09:30**. Si necesitas analizar noticias de ahora mismo, usa el botón.")
+
+    truncar = st.checkbox(
+        "⚠️ Vaciar todas las tablas antes de recargar",
+        value=False,
+        help="Borra todos los artículos y alertas existentes y hace una recarga completa desde cero. Úsalo solo si los datos están corruptos o quieres empezar de nuevo.",
+    )
+
+    confirmacion_ok = True
+    if truncar:
+        st.warning("Esta acción borrará todos los artículos, alertas y entidades existentes. No se puede deshacer.")
+        confirmacion = st.text_input("Escribe **CONFIRMAR** para proceder con el vaciado:")
+        confirmacion_ok = confirmacion.strip() == "CONFIRMAR"
+        if not confirmacion_ok and confirmacion.strip():
+            st.error("El texto no coincide. Escribe exactamente: CONFIRMAR")
+
     col_btn,col_info=st.columns([1,2])
     with col_btn:
-        if st.button("🔄 Analizar noticias ahora",use_container_width=True):
+        boton_label = "🔄 Vaciar y recargar" if truncar else "🔄 Analizar noticias ahora"
+        if st.button(boton_label, use_container_width=True, disabled=(truncar and not confirmacion_ok)):
             with st.spinner("Lanzando análisis..."):
-                ok,result=trigger_job()
-            if ok: st.success(f"Proceso iniciado. En unos minutos verás nuevas alertas. (ID: {result})")
-            else: st.error(f"No se pudo iniciar: {result}")
+                job_params = {"TRUNCATE_TABLES": "true"} if truncar else {}
+                ok,result=trigger_job(job_params)
+            if ok:
+                msg = "Proceso iniciado con vaciado de tablas." if truncar else "Proceso iniciado."
+                st.success(f"{msg} En unos minutos verás nuevas alertas. (ID: {result})")
+            else:
+                st.error(f"No se pudo iniciar: {result}")
     with col_info:
         df_last=qry("SELECT max(ingested_at) AS ultima,count(*) AS total FROM arcas_raw.articles WHERE source_type!='gazette'")
         if not df_last.empty and df_last["ultima"].iloc[0]:
@@ -239,7 +262,6 @@ if page=="🔄 Recargar información":
                 <div style="font-size:1.1rem;font-weight:600;color:#0d0d0d;margin-top:0.2rem;">{ultima}</div>
                 <div style="font-size:0.8rem;color:#888;font-style:italic;">{total:,} noticias almacenadas</div>
             </div>""",unsafe_allow_html=True)
-
 # ══ CUADRO DE MANDOS ══════════════════════════════════════════════════════════
 elif page=="📊 Cuadro de mandos":
     st.markdown('<div class="section-rule">Actividad por día</div>',unsafe_allow_html=True)
