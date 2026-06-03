@@ -156,13 +156,16 @@ def trigger_job(extra_params={}):
     try:
         payload = {"job_id": int(DATABRICKS_JOB_ID)}
         if extra_params:
-            payload["notebook_params"] = extra_params
-        r=requests.post(f"{DATABRICKS_HOST}/api/2.1/jobs/run-now",
-            headers={"Authorization":f"Bearer {DATABRICKS_TOKEN}","Content-Type":"application/json"},
+            payload["job_parameters"] = extra_params
+        r = requests.post(
+            f"{DATABRICKS_HOST}/api/2.1/jobs/run-now",
+            headers={"Authorization": f"Bearer {DATABRICKS_TOKEN}",
+                     "Content-Type": "application/json"},
             json=payload, timeout=15)
         r.raise_for_status()
-        return True,str(r.json().get("run_id","?"))
-    except Exception as e: return False,str(e)
+        return True, str(r.json().get("run_id", "?"))
+    except Exception as e:
+        return False, str(e)
 
 def validate_email(e):
     return bool(re.match(r"^[\w\.\+\-]+@[\w\-]+\.[a-z]{2,}$",e.strip(),re.IGNORECASE))
