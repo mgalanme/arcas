@@ -581,10 +581,8 @@ new_records = []
 if all_records:
     cand_rows = [Row(**r) for r in all_records]
     cand_df = spark.createDataFrame(cand_rows)
-
     existing_hashes = spark.table(TBL_ARTICLES).select("content_hash").distinct()
     new_df = cand_df.join(existing_hashes, on="content_hash", how="left_anti")
-
     new_records = [r.asDict() for r in new_df.collect()]
 
 print(f"New: {len(new_records)} (dedup via Spark left_anti join)")
@@ -609,37 +607,35 @@ if new_records and GROQ_API_KEY:
     llm_calls_estimate += calls_cl
     print(f"  Topics done in {time.time()-t_cl:.1f}s")
 
-if new_records:
-    for r in new_records:
-        r.setdefault("title_es", r.get("title", ""))
-        r.setdefault("topic", "OTRO" if r.get("source_type") != "gazette" else "OFICIAL")
-        r.setdefault("content_snippet", "")
-
-# Columnas exactas de TBL_ARTICLES (sin deep_analysis ni ninguna extra)
+# Columnas exactas de TBL_ARTICLES — nunca mas, nunca menos
 ARTICLE_COLS = [
     "source_type", "source_name", "title", "title_es",
     "content_url", "content_snippet", "pub_date", "language",
     "jurisdiction", "content_hash", "is_factchecker", "topic"
 ]
 
-# Limpiar registros: solo columnas permitidas
-clean_records = [{k: r.get(k, "") for k in ARTICLE_COLS} for r in new_records]
-# Asegurar booleano correcto para is_factchecker
-for r in clean_records:
-    r["is_factchecker"] = bool(r.get("is_factchecker", False))
+if new_records:
+    clean = []
+    for r in new_records:
+        row = {k: r.get(k, "") for k in ARTICLE_COLS}
+        row["is_factchecker"] = bool(r.get("is_factchecker", False))
+        row["title_es"] = row["title_es"] or row["title"]
+        row["topic"] = row["topic"] or ("OFICIAL" if row["source_type"] == "gazette" else "OTRO")
+        row["content_snippet"] = row["content_snippet"] or ""
+        clean.append(row)
 
-df_new = spark.createDataFrame([Row(**r) for r in clean_records])
-df_new = df_new.withColumn("ingested_at", current_timestamp())
+    df_new = spark.createDataFrame([Row(**r) for r in clean])
+    df_new = df_new.withColumn("ingested_at", current_timestamp())
+    df_new.createOrReplaceTempView("new_enriched")
+    spark.sql(f"""
+        MERGE INTO {TBL_ARTICLES} t
+        USING new_enriched n
+        ON t.content_hash = n.content_hash
+        WHEN NOT MATCHED THEN INSERT *
+    """)
+    print(f"Merged {len(clean)} new articles into Delta (idempotent)")
 
-df_new.createOrReplaceTempView("new_enriched")
-spark.sql(f"""
-    MERGE INTO {TBL_ARTICLES} t
-    USING new_enriched n
-    ON t.content_hash = n.content_hash
-    WHEN NOT MATCHED THEN INSERT *
-""")
-
-print(f"Celda 9 total: {time.time()-t9:.1f}s | LLM calls: ~{llm_calls_estimate} (batches muy pequeños)")
+print(f"Celda 9 total: {time.time()-t9:.1f}s | LLM calls: ~{llm_calls_estimate}")
 
 # COMMAND ----------
 
