@@ -772,7 +772,17 @@ elif page=="🔧 Mantenimiento":
     y limpieza de versiones antiguas. Recomendado ejecutar una vez a la semana.
     """)
 
-    col_opt, col_opt_info = st.columns([1, 2])
+    col_rec, col_opt, col_opt_info = st.columns([1, 1, 2])
+    with col_rec:
+        if st.button("🔄 Recargar información", use_container_width=True):
+            with st.spinner("Lanzando recarga..."):
+                ok, result = trigger_job({})
+            if ok:
+                st.success(f"Recarga iniciada. (ID: {result})")
+                st.session_state["opt_run_id"]     = result
+                st.session_state["opt_run_inicio"] = datetime.now()
+            else:
+                st.error(f"No se pudo iniciar: {result}")
     with col_opt:
         if st.button("⚡ Optimizar ahora", use_container_width=True):
             with st.spinner("Lanzando optimización..."):
