@@ -313,7 +313,7 @@ if page=="🔄 Recargar información":
                     padding:1rem 1.5rem;border-radius:2px;margin-top:1rem;">
             <div style="font-family:'JetBrains Mono',monospace;font-size:0.65rem;
                         color:#888;text-transform:uppercase;letter-spacing:0.08em;">
-                Estado del proceso · Run {run_id}
+                Estado del proceso 
             </div>
             <div style="font-size:1.2rem;font-weight:700;color:{color};margin-top:0.3rem;">
                 {etiqueta}
@@ -325,10 +325,13 @@ if page=="🔄 Recargar información":
         """, unsafe_allow_html=True)
 
         if lc in ("PENDING", "RUNNING", "TERMINATING"):
-            if st.button("🔃 Actualizar estado", key="refresh_status"):
-                st.rerun()
+            import time as _time
+            st.caption("La página se actualizará automáticamente cada 3 minutos.")
+            _time.sleep(180)
+            st.rerun()
         elif lc == "TERMINATED":
-            if st.button("✖ Cerrar seguimiento", key="clear_run"):
+            if st.button("✖ Ocultar estado", key="clear_run",
+                         help="Oculta este panel. El proceso en Databricks no se ve afectado."):
                 del st.session_state["run_id"]
                 del st.session_state["run_inicio"]
                 st.rerun()
@@ -460,20 +463,63 @@ elif page=="📊 Cuadro de mandos":
             else:
                 st.info("Campo topic disponible desde la próxima ingesta.")
 
+        # Filtro por temática con botones
         st.markdown('<div class="section-rule-light">Noticias del día</div>',unsafe_allow_html=True)
-        for _,row in df_day.iterrows():
-            cat=str(row.get("category","?")); topic=str(row.get("topic","") or "")
-            title=str(row.get("title",""))[:75]; source=str(row.get("source_name",""))
-            conf=float(row.get("confidence_score",0)); color=CAT_INFO.get(cat,("?","#888"))[1]
-            topic_html=f'<span class="topic-pill">{topic}</span>' if topic and topic!="None" else ""
-            st.markdown(f"""<div class="alert-card" style="--ac:{color};">
-                <div class="alert-headline">{title}…</div>
-                <div class="alert-byline">
-                    <span class="badge b-{cat}">{CAT_INFO.get(cat,("?",""))[0]}</span>
-                    {topic_html} · {source} · {conf:.0%}
-                </div></div>""",unsafe_allow_html=True)
+        topics_day = ["Todas"] + sorted(
+            [t for t in df_day["topic"].dropna().unique().tolist()
+             if t and t != "None"]
+        )[:10] if "topic" in df_day.columns else ["Todas"]
+
+        if "dash_topic_filter" not in st.session_state:
+            st.session_state["dash_topic_filter"] = "Todas"
+
+        topic_cols = st.columns(min(len(topics_day), 6))
+        for i, t in enumerate(topics_day[:6]):
+            with topic_cols[i]:
+                active = st.session_state["dash_topic_filter"] == t
+                style  = "background:#1a1a1a;color:#f5f2ec;" if active else ""
+                if st.button(t, key=f"dtopic_{t}_{sel_day}", use_container_width=True):
+                    st.session_state["dash_topic_filter"] = t
+                    st.rerun()
+        if len(topics_day) > 6:
+            topic_cols2 = st.columns(min(len(topics_day)-6, 6))
+            for i, t in enumerate(topics_day[6:12]):
+                with topic_cols2[i]:
+                    if st.button(t, key=f"dtopic2_{t}_{sel_day}", use_container_width=True):
+                        st.session_state["dash_topic_filter"] = t
+                        st.rerun()
+
+        df_filtered = df_day.copy()
+        active_topic = st.session_state.get("dash_topic_filter","Todas")
+        if active_topic != "Todas" and "topic" in df_filtered.columns:
+            df_filtered = df_filtered[df_filtered["topic"] == active_topic]
+
+        st.markdown(f"**{len(df_filtered)} noticia(s)**"
+                    + (f" · temática: {active_topic}" if active_topic != "Todas" else ""))
+
+        # Dos columnas de noticias
+        rows = df_filtered.iterrows()
+        pairs = list(rows)
+        for i in range(0, len(pairs), 2):
+            col_a, col_b = st.columns(2)
+            for col, (_, row) in zip([col_a, col_b], pairs[i:i+2]):
+                with col:
+                    cat   = str(row.get("category","?"))
+                    topic = str(row.get("topic","") or "")
+                    title = str(row.get("title",""))[:80]
+                    src   = str(row.get("source_name",""))
+                    conf  = float(row.get("confidence_score",0))
+                    color = CAT_INFO.get(cat,("?","#888"))[1]
+                    th    = f'<span class="topic-pill">{topic}</span>' if topic and topic!="None" else ""
+                    st.markdown(f"""<div class="alert-card" style="--ac:{color};">
+                        <div class="alert-headline">{title}…</div>
+                        <div class="alert-byline">
+                            <span class="badge b-{cat}">{CAT_INFO.get(cat,("?",""))[0]}</span>
+                            {th} · {src} · {conf:.0%}
+                        </div></div>""",unsafe_allow_html=True)
     else:
         st.info(f"No hay alertas para el día {sel_day}.")
+
 
 # ══ DECISIONES PENDIENTES ═════════════════════════════════════════════════════
 elif page=="✅ Decisiones pendientes":
@@ -580,17 +626,41 @@ elif page=="📋 Historial de decisiones":
             grupo=df_hist[df_hist["status"]==sv]
             if grupo.empty: continue
             st.markdown(f'<div class="section-rule-light">{icon} {label} ({len(grupo)})</div>',unsafe_allow_html=True)
+
+            # Filtro por temática para este grupo
+            topics_g = ["Todas"] + sorted(
+                [t for t in grupo["topic"].dropna().unique().tolist()
+                 if t and t != "None"]
+            )[:10] if "topic" in grupo.columns else ["Todas"]
+
+            filter_key = f"hist_topic_{sv}"
+            if filter_key not in st.session_state:
+                st.session_state[filter_key] = "Todas"
+
+            if len(topics_g) > 1:
+                tcols = st.columns(min(len(topics_g), 7))
+                for i, t in enumerate(topics_g[:7]):
+                    with tcols[i]:
+                        if st.button(t, key=f"ht_{sv}_{t}", use_container_width=True):
+                            st.session_state[filter_key] = t
+                            st.rerun()
+                active_t = st.session_state.get(filter_key,"Todas")
+                if active_t != "Todas":
+                    grupo = grupo[grupo["topic"]==active_t]
+                st.markdown(f"**{len(grupo)} noticia(s)**"
+                            + (f" · {active_t}" if active_t!="Todas" else ""))
+
             for _,row in grupo.iterrows():
                 cat=str(row["category"]); conf=float(row["confidence_score"])
                 title=str(row["title"]); source=str(row["source_name"])
                 url=str(row["content_url"]); analysis=str(row["nl_justification"])
                 alert_id=str(row["alert_id"]); topic=str(row.get("topic","") or "")
                 color=CAT_INFO.get(cat,("?","#888"))[1]
-                topic_html=f'<span class="topic-pill">{topic}</span>' if topic and topic!="None" else ""
-                with st.expander(f"[{CAT_INFO.get(cat,('?',''))[0]}] {title[:60]}… · {conf:.0%}"):
+                th=f'<span class="topic-pill">{topic}</span>' if topic and topic!="None" else ""
+                with st.expander(f"[{CAT_INFO.get(cat,('?',''))[0]}] {title[:65]}… · {conf:.0%}"):
                     st.markdown(f"""<div class="alert-byline" style="margin-bottom:0.6rem;">
                         <span class="badge b-{cat}">{CAT_INFO.get(cat,('?',''))[0]}</span>
-                        {topic_html} · {source}
+                        {th} · {source}
                     </div>""",unsafe_allow_html=True)
                     if url: st.markdown(f"🔗 [Ver noticia]({url})")
                     with st.expander("Ver análisis"):
@@ -605,6 +675,7 @@ elif page=="📋 Historial de decisiones":
                             if st.button(labels[nueva],key=f"hist_{alert_id}_{nueva}"):
                                 update_alerts([alert_id],nueva); st.rerun()
 
+
 # ══ GENERAR PUBLICACIONES ═════════════════════════════════════════════════════
 elif page=="✍️ Generar publicaciones":
     st.markdown('<div class="section-rule">Redactar publicación para redes sociales</div>',unsafe_allow_html=True)
@@ -616,7 +687,7 @@ elif page=="✍️ Generar publicaciones":
     else:
         cS,cL=st.columns([2,1])
         with cS:
-            options={f"[{row['category']}] {str(row['title'])[:55]}…":row for _,row in df.iterrows()}
+            options={f"[{row['category']}] {str(row['title'])[:130]}…":row for _,row in df.iterrows()}
             sel_label=st.selectbox("Noticia a publicar",list(options.keys()))
             sel=options[sel_label]
         with cL:
