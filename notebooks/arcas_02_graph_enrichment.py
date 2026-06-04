@@ -12,6 +12,7 @@
 # Ejecutar: manualmente o como Job semanal independiente
 
 # COMMAND ----------
+
 # Celda 1: Imports y configuracion
 
 import requests, json, hashlib, re, logging, time
@@ -46,6 +47,7 @@ TBL_ENTITY_TIMELINE = f"{DB_PROCESSED}.entity_timeline"
 print(f"GROQ: {bool(GROQ_API_KEY)} | Neo4j: {bool(NEO4J_URI)}")
 
 # COMMAND ----------
+
 # Celda 2: Crear tabla entity_timeline si no existe
 # Esta tabla es el corazon del Nivel 2:
 # acumula la historia completa de cada entidad a lo largo del tiempo
@@ -79,6 +81,7 @@ TBLPROPERTIES ('delta.enableChangeDataFeed' = 'true')
 print("entity_timeline table ready")
 
 # COMMAND ----------
+
 # Celda 3: Consolidar entidades duplicadas desde TBL_ENTITIES
 
 df_ent = spark.sql(f"""
@@ -101,6 +104,7 @@ print(f"Unique entities: {df_ent.count()}")
 df_ent.show(10, truncate=40)
 
 # COMMAND ----------
+
 # Celda 4: Calcular metricas temporales
 
 df_metrics = df_ent.withColumn(
@@ -142,6 +146,7 @@ df_metrics.select("entity_name","entity_type","active_days",
                   "total_mentions","mentions_per_week","trend").show(15, truncate=30)
 
 # COMMAND ----------
+
 # Celda 5: Cruzar entidades con alertas para obtener categorias y topics
 
 df_alerts_summary = spark.sql(f"""
@@ -184,6 +189,7 @@ df_final = df_metrics.join(
 print(f"Entities with category/topic enrichment: {df_final.count()}")
 
 # COMMAND ----------
+
 # Celda 6: Detectar anomalias de velocidad procesal
 # Comparar entidades judiciales entre si:
 # Si una persona/caso politico tiene active_days muy corto vs otros → sospechoso
@@ -249,6 +255,7 @@ anomalies = df_final.filter(F.col("anomaly_flag") == True).count()
 print(f"Anomalies detected: {anomalies}")
 
 # COMMAND ----------
+
 # Celda 7: Guardar entity_timeline en Delta
 
 from pyspark.sql.functions import current_timestamp, lit
@@ -269,8 +276,8 @@ df_to_save = df_final.select(
     F.coalesce(F.col("associated_topics"), F.lit("")).alias("associated_topics"),
     F.col("sources_list"),
     F.col("alert_count").cast(IntegerType()),
-    F.coalesce(F.col("velocity_score"), F.lit(0.0)).cast(DoubleType()),
-    F.coalesce(F.col("anomaly_flag"),   F.lit(False)).cast(BooleanType()),
+    F.coalesce(F.col("velocity_score"), F.lit(0.0)).cast(DoubleType()).alias("velocity_score"),
+    F.coalesce(F.col("anomaly_flag"),   F.lit(False)).cast(BooleanType()).alias("anomaly_flag"),
     F.coalesce(F.col("anomaly_reason"), F.lit("")).alias("anomaly_reason"),
     current_timestamp().alias("updated_at"),
 )
@@ -281,6 +288,7 @@ total = df_to_save.count()
 print(f"Saved {total} entities to {TBL_ENTITY_TIMELINE}")
 
 # COMMAND ----------
+
 # Celda 8: Escribir entidades enriquecidas en Neo4j
 
 if NEO4J_URI and total > 0:
@@ -346,6 +354,7 @@ else:
     print("Neo4j: skipped")
 
 # COMMAND ----------
+
 # Celda 9: Generar alertas de nivel 2 para anomalias detectadas
 
 import uuid
@@ -421,6 +430,7 @@ else:
     print("No Level-2 anomalies this run")
 
 # COMMAND ----------
+
 # Celda 10: Resumen
 
 te = spark.sql(f"SELECT count(*) AS n FROM {TBL_ENTITY_TIMELINE}").collect()[0]["n"]
