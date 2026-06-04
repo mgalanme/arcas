@@ -220,11 +220,12 @@ with st.sidebar:
         unsafe_allow_html=True)
     page=st.radio("nav",[
         "🔄 Recargar información",
+        "🔧 Mantenimiento",
         "📊 Cuadro de mandos",
         "✅ Decisiones pendientes",
         "📋 Historial de decisiones",
         "✍️ Generar publicaciones",
-        "🔧 Mantenimiento",
+        "🌐 Grafo de entidades",
     ],label_visibility="collapsed")
     st.markdown("---")
     st.markdown("""<div style="font-family:'JetBrains Mono',monospace;font-size:0.56rem;
@@ -882,3 +883,158 @@ elif page=="🔧 Mantenimiento":
 
 
         
+
+# ══ GRAFO DE ENTIDADES ═══════════════════════════════════════════════════════
+elif page=="🌐 Grafo de entidades":
+    st.markdown('<div class="section-rule">Entidades detectadas y sus patrones temporales</div>',
+                unsafe_allow_html=True)
+    st.markdown("""
+    Personas, organismos y casos extraídos de las noticias analizadas.
+    Las entidades marcadas como anomalía presentan una velocidad procesal
+    significativamente distinta a la media de casos similares.
+    """)
+
+    # ── Cargar datos ──────────────────────────────────────────────────────────
+    df_et = qry("""
+        SELECT entity_name, entity_type, first_seen, last_seen,
+               total_mentions, active_days, mentions_per_week, trend,
+               associated_cats, associated_topics, sources_list,
+               velocity_score, anomaly_flag, anomaly_reason
+        FROM arcas_processed.entity_timeline
+        ORDER BY total_mentions DESC
+    """)
+
+    if df_et.empty:
+        st.info("Todavía no hay datos del grafo. Ejecuta el Job semanal de enriquecimiento (ARCAS Weekly Agg) para generarlos.")
+    else:
+        # ── KPIs ──────────────────────────────────────────────────────────────
+        total_ent  = len(df_et)
+        anomalies  = len(df_et[df_et["anomaly_flag"]==True]) if "anomaly_flag" in df_et.columns else 0
+        growing    = len(df_et[df_et["trend"]=="CRECIENTE"]) if "trend" in df_et.columns else 0
+        judicial   = len(df_et[df_et["associated_cats"].str.contains("C", na=False)]) if "associated_cats" in df_et.columns else 0
+
+        c1,c2,c3,c4 = st.columns(4)
+        for col,val,label,color in [
+            (c1, total_ent, "Entidades identificadas", "#1a5276"),
+            (c2, anomalies, "Anomalías de velocidad",  "#c0392b"),
+            (c3, growing,   "Con tendencia creciente", "#8B6914"),
+            (c4, judicial,  "En contexto judicial",    "#1a7a4a"),
+        ]:
+            col.markdown(f"""
+            <div class="kpi-card" style="--kc:{color};">
+                <div class="kpi-value">{val}</div>
+                <div class="kpi-label">{label}</div>
+            </div>""", unsafe_allow_html=True)
+
+        st.markdown("<br>", unsafe_allow_html=True)
+
+        # ── Filtros ───────────────────────────────────────────────────────────
+        col_f1, col_f2, col_f3 = st.columns(3)
+        with col_f1:
+            tipos = ["Todos"] + sorted(df_et["entity_type"].dropna().unique().tolist())
+            tipo_filter = st.selectbox("Tipo de entidad", tipos)
+        with col_f2:
+            tendencias = ["Todas"] + sorted(df_et["trend"].dropna().unique().tolist())
+            trend_filter = st.selectbox("Tendencia", tendencias)
+        with col_f3:
+            solo_anomalias = st.checkbox("Solo anomalías", value=False)
+
+        df_view = df_et.copy()
+        if tipo_filter  != "Todos":  df_view = df_view[df_view["entity_type"]==tipo_filter]
+        if trend_filter != "Todas":  df_view = df_view[df_view["trend"]==trend_filter]
+        if solo_anomalias:           df_view = df_view[df_view["anomaly_flag"]==True]
+
+        st.markdown(f"**{len(df_view)} entidad(es)**")
+
+        # ── Anomalías destacadas ───────────────────────────────────────────────
+        df_anom = df_view[df_view["anomaly_flag"]==True] if "anomaly_flag" in df_view.columns else df_view.head(0)
+        if not df_anom.empty:
+            st.markdown('<div class="section-rule-light">⚠️ Anomalías de velocidad procesal detectadas</div>',
+                        unsafe_allow_html=True)
+            for _, row in df_anom.iterrows():
+                name    = str(row.get("entity_name",""))
+                reason  = str(row.get("anomaly_reason",""))
+                vs      = float(row.get("velocity_score",0) or 0)
+                days    = int(row.get("active_days",0) or 0)
+                mpw     = float(row.get("mentions_per_week",0) or 0)
+                sources = str(row.get("sources_list",""))[:80]
+                color   = "#c0392b" if vs > 0 else "#d35400"
+                icon    = "🐢" if vs > 0 else "⚡"
+                label   = "Dilación significativa" if vs > 0 else "Velocidad inusual"
+                st.markdown(f"""
+                <div class="alert-card" style="--ac:{color};">
+                    <div class="alert-headline">{icon} {name}
+                        <span style="font-size:0.75rem;font-weight:400;color:#888;margin-left:0.5rem;">
+                            {label} · score {vs:+.2f}σ
+                        </span>
+                    </div>
+                    <div class="alert-byline">{reason}</div>
+                    <div class="alert-byline" style="margin-top:0.2rem;">
+                        {days} días activo · {mpw:.1f} menciones/semana · {sources}
+                    </div>
+                </div>""", unsafe_allow_html=True)
+
+        # ── Tabla completa ─────────────────────────────────────────────────────
+        st.markdown('<div class="section-rule-light">Todas las entidades</div>',
+                    unsafe_allow_html=True)
+
+        TREND_ICONS = {
+            "CRECIENTE": "🔴", "ACTIVO": "🟡",
+            "ESTABLE":   "🟢", "INACTIVO": "⚫",
+        }
+
+        for _, row in df_view.head(50).iterrows():
+            name    = str(row.get("entity_name",""))
+            etype   = str(row.get("entity_type",""))
+            trend   = str(row.get("trend","ESTABLE"))
+            days    = int(row.get("active_days",0) or 0)
+            mentions= int(row.get("total_mentions",0) or 0)
+            mpw     = float(row.get("mentions_per_week",0) or 0)
+            cats    = str(row.get("associated_cats","") or "")
+            topics  = str(row.get("associated_topics","") or "")
+            sources = str(row.get("sources_list","") or "")[:60]
+            fs      = str(row.get("first_seen",""))[:10]
+            ls      = str(row.get("last_seen",""))[:10]
+            anomaly = bool(row.get("anomaly_flag", False))
+            vs      = float(row.get("velocity_score",0) or 0)
+
+            trend_icon = TREND_ICONS.get(trend, "⚪")
+            border_color = "#c0392b" if anomaly else "#ddd8ce"
+
+            with st.expander(
+                f"{trend_icon} {name} · {etype} · {mentions} menciones · {days} días"
+            ):
+                col_a, col_b, col_c = st.columns(3)
+                with col_a:
+                    st.markdown(f"""
+                    <div style="font-family:'JetBrains Mono',monospace;font-size:0.72rem;
+                                line-height:1.9;color:#444;">
+                        <strong>Primera mención:</strong> {fs}<br>
+                        <strong>Última mención:</strong> {ls}<br>
+                        <strong>Días activo:</strong> {days}<br>
+                        <strong>Menciones/semana:</strong> {mpw:.1f}
+                    </div>""", unsafe_allow_html=True)
+                with col_b:
+                    st.markdown(f"""
+                    <div style="font-family:'JetBrains Mono',monospace;font-size:0.72rem;
+                                line-height:1.9;color:#444;">
+                        <strong>Tendencia:</strong> {trend_icon} {trend}<br>
+                        <strong>Categorías:</strong> {cats or "—"}<br>
+                        <strong>Temáticas:</strong> {topics or "—"}<br>
+                        <strong>Vel. score:</strong> {vs:+.2f}σ
+                    </div>""", unsafe_allow_html=True)
+                with col_c:
+                    st.markdown(f"""
+                    <div style="font-family:'JetBrains Mono',monospace;font-size:0.68rem;
+                                line-height:1.8;color:#888;">
+                        <strong>Fuentes:</strong><br>{sources}…
+                    </div>""", unsafe_allow_html=True)
+
+                if anomaly:
+                    reason = str(row.get("anomaly_reason",""))
+                    st.markdown(f"""
+                    <div style="background:#fdf2f0;border:1px solid #e63946;
+                                border-radius:4px;padding:0.6rem 1rem;margin-top:0.5rem;
+                                font-size:0.82rem;color:#c0392b;">
+                        ⚠️ <strong>Anomalía:</strong> {reason}
+                    </div>""", unsafe_allow_html=True)
