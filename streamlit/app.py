@@ -100,7 +100,8 @@ DATABRICKS_HOST   = st.secrets.get("DATABRICKS_HOST","").rstrip("/")
 DATABRICKS_TOKEN  = st.secrets.get("DATABRICKS_TOKEN","")
 DATABRICKS_HTTP   = st.secrets.get("DATABRICKS_HTTP_PATH","")
 GROQ_API_KEY      = st.secrets.get("GROQ_API_KEY","")
-DATABRICKS_JOB_ID = "998370935632321"
+DATABRICKS_JOB_ID       = "998370935632321"
+DATABRICKS_OPTIMIZE_ID  = "998370935632321"  # mismo Job, param RUN_OPTIMIZE=true
 
 CAT_INFO={
     "A":("Contratación Pública","#c0392b"),
@@ -223,6 +224,7 @@ with st.sidebar:
         "✅ Decisiones pendientes",
         "📋 Historial de decisiones",
         "✍️ Generar publicaciones",
+        "🔧 Mantenimiento",
     ],label_visibility="collapsed")
     st.markdown("---")
     st.markdown("""<div style="font-family:'JetBrains Mono',monospace;font-size:0.56rem;
@@ -700,6 +702,118 @@ elif page=="✍️ Generar publicaciones":
             tone=st.radio("Tono",["Informativo","Analítico","Urgente","Pedagógico"],horizontal=True)
         char_limits={"Facebook / LinkedIn":3000,"X (Twitter)":280,"Instagram":2200}
         char_limit=char_limits[platform]
+
+# ══ MANTENIMIENTO ════════════════════════════════════════════════════════════
+elif page=="🔧 Mantenimiento":
+    st.markdown('<div class="section-rule">Mantenimiento del sistema</div>', unsafe_allow_html=True)
+    st.markdown("Operaciones de mantenimiento sobre las tablas de datos. Úsalas solo cuando sea necesario.")
+
+    # ── Bloque 1: Optimización ────────────────────────────────────────────────
+    st.markdown('<div class="section-rule-light">Optimización de tablas</div>', unsafe_allow_html=True)
+    st.markdown("""
+    Reorganiza los datos internamente para que las consultas sean más rápidas.
+    Incluye compactación de archivos, reordenación por campos de búsqueda frecuente
+    y limpieza de versiones antiguas. Recomendado ejecutar una vez a la semana.
+    """)
+
+    col_opt, col_opt_info = st.columns([1, 2])
+    with col_opt:
+        if st.button("⚡ Optimizar ahora", use_container_width=True):
+            with st.spinner("Lanzando optimización..."):
+                ok, result = trigger_job({"RUN_OPTIMIZE": "true"})
+            if ok:
+                st.success(f"Optimización iniciada. Tardará 2-3 minutos. (ID: {result})")
+                st.session_state["opt_run_id"]    = result
+                st.session_state["opt_run_inicio"] = datetime.now()
+            else:
+                st.error(f"No se pudo iniciar: {result}")
+
+    with col_opt_info:
+        st.markdown("""
+        <div style="background:#fff;border:1px solid #ddd8ce;padding:1rem 1.3rem;border-radius:2px;">
+            <div style="font-family:'JetBrains Mono',monospace;font-size:0.65rem;color:#888;
+                        text-transform:uppercase;letter-spacing:0.08em;">Qué hace esta operación</div>
+            <div style="font-size:0.82rem;color:#444;margin-top:0.4rem;line-height:1.7;">
+                · Compacta los archivos pequeños en bloques más grandes<br>
+                · Reordena los datos por los campos más consultados<br>
+                · Elimina versiones antiguas que ya no se necesitan<br>
+                · Actualiza las estadísticas para acelerar las búsquedas
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    # Seguimiento optimización
+    if st.session_state.get("opt_run_id"):
+        run_id  = st.session_state["opt_run_id"]
+        inicio  = st.session_state.get("opt_run_inicio", datetime.now())
+        status  = get_run_status(run_id)
+        lc      = status["life_cycle"]
+        ahora   = datetime.now()
+        mm, ss  = divmod(int((ahora - inicio).total_seconds()), 60)
+
+        ESTADO_ES = {
+            "PENDING":    ("⏳ En cola...",        "#8B6914"),
+            "RUNNING":    ("⚙️ Ejecutándose...",   "#1a5276"),
+            "TERMINATING":("⚙️ Finalizando...",    "#1a5276"),
+            "TERMINATED": ("✅ Optimización completada", "#1a7a4a"),
+            "INTERNAL_ERROR": ("❌ Error",         "#c0392b"),
+            "UNKNOWN":    ("❓ Desconocido",        "#888"),
+        }
+        etiqueta, color = ESTADO_ES.get(lc, (lc, "#888"))
+        if lc == "TERMINATED" and status["result"] not in ("SUCCESS",""):
+            etiqueta, color = f"❌ Fallido ({status['result']})", "#c0392b"
+
+        if lc == "TERMINATED" and status["start_time"] and status["end_time"]:
+            dur_real = int((status["end_time"] - status["start_time"]) / 1000)
+            mm2, ss2 = divmod(dur_real, 60)
+            dur_str  = f"{mm2}m {ss2}s"
+        else:
+            dur_str = f"{mm}m {ss}s (en curso)"
+
+        st.markdown(f"""
+        <div style="background:#fff;border:1px solid #ddd8ce;border-left:4px solid {color};
+                    padding:1rem 1.5rem;border-radius:2px;margin-top:1rem;">
+            <div style="font-size:1.1rem;font-weight:700;color:{color};">{etiqueta}</div>
+            <div style="font-size:0.78rem;color:#888;margin-top:0.2rem;">
+                Inicio: {inicio.strftime("%d/%m/%Y %H:%M:%S")} · Duración: {dur_str}
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        if lc in ("PENDING","RUNNING","TERMINATING"):
+            import time as _t; _t.sleep(180); st.rerun()
+        elif lc == "TERMINATED":
+            if st.button("✖ Ocultar estado", key="clear_opt",
+                         help="Oculta este panel. El proceso no se ve afectado."):
+                del st.session_state["opt_run_id"]
+                del st.session_state["opt_run_inicio"]
+                st.rerun()
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # ── Bloque 2: Estado actual de tablas ─────────────────────────────────────
+    st.markdown('<div class="section-rule-light">Estado actual de las tablas</div>', unsafe_allow_html=True)
+    if st.button("🔍 Ver estadísticas", use_container_width=False):
+        tablas = [
+            ("Noticias (medios)",    "SELECT count(*) AS n FROM arcas_raw.articles WHERE source_type!='gazette'"),
+            ("Noticias (BOE/oficial)","SELECT count(*) AS n FROM arcas_raw.articles WHERE source_type='gazette'"),
+            ("Alertas totales",      "SELECT count(*) AS n FROM arcas_processed.alerts"),
+            ("Alertas pendientes",   "SELECT count(*) AS n FROM arcas_processed.alerts WHERE status='pending'"),
+            ("Entidades en grafo",   "SELECT count(*) AS n FROM arcas_processed.entities"),
+            ("Relaciones en grafo",  "SELECT count(*) AS n FROM arcas_processed.relations"),
+        ]
+        cols = st.columns(3)
+        for i, (label, q) in enumerate(tablas):
+            df_t = qry(q)
+            val  = int(df_t["n"].iloc[0]) if not df_t.empty else 0
+            with cols[i % 3]:
+                st.markdown(f"""
+                <div class="kpi-card" style="--kc:#1a1a1a;margin-bottom:0.8rem;">
+                    <div class="kpi-value">{val:,}</div>
+                    <div class="kpi-label">{label}</div>
+                </div>
+                """, unsafe_allow_html=True)
+
 
         st.markdown('<div class="section-rule-light">Instrucciones al redactor</div>',unsafe_allow_html=True)
         DEFAULT_PROMPT="""Eres un periodista de investigación riguroso y políticamente neutral.

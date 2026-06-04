@@ -1,26 +1,18 @@
 # Databricks notebook source
-# ARCAS - 01_ingestion_daily v8
-# Cambios v8 (FIXES a los problemas de batching reportados):
-#   - Tamaño de batch MUY conservador: MAX 4 para traducción, MAX 6 para clasificación.
-#     Evita 413 Payload Too Large completamente.
-#   - Chunks automáticos + fallback por chunk a llamadas individuales cuando falla el parse JSON.
-#   - Parser JSON robusto (_safe_json_loads): extrae substring [ ... ], quita ```, intenta limpiar.
-#   - Detección explícita de 413 en groq_invoke → señal "__PAYLOAD_TOO_LARGE__" para reducir batch.
-#   - Más sleeps entre batches (1.5s) + backoff mejorado en 429.
-#   - Heurística más agresiva para reducir items que llegan a LLM.
-#   - Prompts más cortos y estrictos ("SOLO JSON array, nada más").
-#   - Mantiene todas las mejoras de rendimiento de v7 (dedup Spark, parallel scrape, parallel deep analysis, MERGE, fast model).
-#   - v8 es la versión estable recomendada para producción en Databricks.
+# ARCAS - 01_ingestion_daily v6
+# Cambios v6:
+#   - Campo topic: Groq clasifica cada articulo en POLITICA/JUDICIAL/ECONOMIA/SALUD/DESINFORMACION/PSEUDOCIENCIA/OTRO
+#   - Nuevas fuentes: pseudociencias y salud (Maldita Ciencia, El Mundo Salud, 20minutos, etc)
+#   - Filtro desinformacion ampliado con keywords de pseudociencia
+#   - BOE excluido de alertas (solo contraste)
 
 # COMMAND ----------
-
 # Celda 1: Imports y configuracion
 
 import requests, json, hashlib, re, logging, time
-from datetime import date, timedelta, datetime, timezone
+from datetime import date, timedelta
 import xml.etree.ElementTree as ET
 from bs4 import BeautifulSoup
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
@@ -39,8 +31,7 @@ GROQ_API_KEY   = get_param("GROQ_API_KEY")
 NEO4J_URI      = get_param("NEO4J_URI")
 NEO4J_USER     = get_param("NEO4J_USERNAME")
 NEO4J_PASSWORD = get_param("NEO4J_PASSWORD")
-GROQ_MODEL      = "llama-3.3-70b-versatile"     # Para deep analysis (calidad)
-GROQ_FAST_MODEL = "llama-3.1-8b-instant"        # Para translate + topic classify (velocidad + más RPM)
+GROQ_MODEL     = "llama-3.3-70b-versatile"
 
 DB_RAW        = "arcas_raw"
 DB_PROCESSED  = "arcas_processed"
@@ -51,64 +42,19 @@ TBL_RELATIONS = f"{DB_PROCESSED}.relations"
 
 VALID_TOPICS = ["POLITICA","JUDICIAL","ECONOMIA","SALUD","DESINFORMACION","PSEUDOCIENCIA","OTRO"]
 
-# Keywords mínimas para clasificación heurística de topic (temprano en el script)
-TOPIC_KEYWORDS = {
-    "JUDICIAL": [
-        "juez", "tribunal", "sentencia", "fiscal", "sumario", "audiencia nacional",
-        "tribunal supremo", "magistrado", "instruccion", "juzgado", "imputado", "investigado",
-        "peinado", "garcia-castejon", "acusacion", "fiscalia", "delito", "penal"
-    ],
-    "POLITICA": [
-        "psoe", "pp", "vox", "podemos", "partido socialista", "partido popular",
-        "ciudadanos", "sumar", "junts", "pnv", "sanchez", "feijoo", "abascal",
-        "yolanda diaz", "begoña", "abalos", "gobierno", "congreso", "senado", "elecciones",
-        "coalicion", "presupuesto", "ministro", "vicepresident"
-    ],
-    "ECONOMIA": [
-        "economia", "bolsa", "ibex", "inflacion", "paro", "empleo", "pib", "presupuestos",
-        "impuestos", "deuda", "deficit", "crecimiento", "empresa", "adjudicacion", "licitacion",
-        "contrato publico", "subvencion"
-    ],
-    "SALUD": [
-        "salud", "vacuna", "covid", "hospital", "medico", "enfermedad", "cancer",
-        "pandemia", "sanitario", "oms", "medicamento", "terapia"
-    ],
-    "DESINFORMACION": [
-        "bulo", "falso", "mentira", "desinformacion", "fake", "desmentido", "verificado",
-        "sin evidencia", "manipulado", "fuera de contexto", "propaganda", "viral", "hoax",
-        "no es cierto", "es falso que", "sin pruebas", "acusacion sin base",
-        "vito quiles", "ndongo", "bertrand ndongo"
-    ],
-    "PSEUDOCIENCIA": [
-        "homeopatia", "homeopatico", "pseudociencia", "pseudoterapia", "curandero",
-        "milagro", "cura milagrosa", "medicina alternativa", "sin evidencia cientifica",
-        "no avalado", "conspiracion", "chemtrails", "antivacunas", "ivermectina",
-        "terraplanismo", "esoterico", "astrologico", "cristaloterapia", "sanacion energetica",
-        "medicina cuantica", "bioresonancia", "flores de bach"
-    ],
-}
-
-# Batch sizes muy conservadores para evitar 413 y prompts demasiado grandes
-MAX_BATCH_SIZE_TRANSLATE = 4
-MAX_BATCH_SIZE_CLASSIFY = 6
-
-print(f"GROQ: {bool(GROQ_API_KEY)} | Neo4j: {bool(NEO4J_URI)} | Fast model: {GROQ_FAST_MODEL}")
+RUN_OPTIMIZE = get_param("RUN_OPTIMIZE", "false").lower() == "true"
+print(f"GROQ: {bool(GROQ_API_KEY)} | Neo4j: {bool(NEO4J_URI)} | Optimize: {RUN_OPTIMIZE}")
 
 # COMMAND ----------
+# Celda 2: TRUNCAR (solo uso manual excepcional)
 
-# Celda 2: Truncado condicional via parametro del Job
-truncate = get_param("TRUNCATE_TABLES", "false").lower() == "true"
-if truncate:
-    spark.sql(f"TRUNCATE TABLE {TBL_ARTICLES}")
-    spark.sql(f"TRUNCATE TABLE {TBL_ALERTS}")
-    spark.sql(f"TRUNCATE TABLE {TBL_ENTITIES}")
-    spark.sql(f"TRUNCATE TABLE {TBL_RELATIONS}")
-    print("Tablas truncadas — recarga completa forzada")
-else:
-    print("Truncado omitido — modo incremental")
+# spark.sql(f"TRUNCATE TABLE {TBL_ARTICLES}")
+# spark.sql(f"TRUNCATE TABLE {TBL_ALERTS}")
+# spark.sql(f"TRUNCATE TABLE {TBL_ENTITIES}")
+# spark.sql(f"TRUNCATE TABLE {TBL_RELATIONS}")
+# print("Truncado completo")
 
 # COMMAND ----------
-
 # Celda 3: Credibilidad de fuentes
 
 SOURCE_CREDIBILITY = {
@@ -128,251 +74,51 @@ def get_credibility(source): return SOURCE_CREDIBILITY.get(source, 0.60)
 print("Credibility OK")
 
 # COMMAND ----------
+# Celda 4: Groq helpers
 
-# Celda 4: Groq helpers v8 (batch pequeño + robusto)
-
-def groq_invoke(prompt, max_tokens=500, temperature=0.1, model=None):
-    """Llamada a Groq con reintentos, soporte de modelo y detección de 413."""
-    model = model or GROQ_MODEL
-    for attempt in range(4):
+def groq_invoke(prompt, max_tokens=500, temperature=0.1):
+    for attempt in range(3):
         try:
             r = requests.post(
                 "https://api.groq.com/openai/v1/chat/completions",
                 headers={"Authorization": f"Bearer {GROQ_API_KEY}",
                          "Content-Type":"application/json"},
-                json={"model": model,
+                json={"model":GROQ_MODEL,
                       "messages":[{"role":"user","content":prompt}],
                       "max_tokens":max_tokens,"temperature":temperature},
-                timeout=50,
+                timeout=30,
             )
             if r.status_code == 429:
-                wait = 15 * (attempt + 1)
-                log.warning(f"Groq 429 - waiting {wait}s (attempt {attempt+1})")
-                time.sleep(wait)
-                continue
-            if r.status_code == 413:
-                log.warning("Groq 413 Payload Too Large - señal para usar batch más pequeño")
-                return "__PAYLOAD_TOO_LARGE__"
+                time.sleep(20*(attempt+1)); continue
             r.raise_for_status()
             return r.json()["choices"][0]["message"]["content"].strip()
         except Exception as e:
-            log.warning(f"Groq {attempt+1}/{4} ({model}): {e}")
-            time.sleep(5 + attempt * 2)
+            log.warning(f"Groq {attempt+1}: {e}"); time.sleep(5)
     return ""
 
 def translate_to_spanish(title):
-    """Individual (fallback seguro)."""
     markers = ["el ","la ","los ","las ","de ","del ","en ","por ","que ","con "]
     if any(m in title.lower() for m in markers): return title
     r = groq_invoke(f"Traduce al espanol solo el titular:\n{title}",
-                    max_tokens=80, temperature=0.0, model=GROQ_FAST_MODEL)
+                    max_tokens=80, temperature=0.0)
     return r if r else title
 
 def classify_topic(title, snippet=""):
-    """Individual (fallback seguro)."""
-    prompt = f"""Clasifica este articulo en UNA categoria:
+    """Classify article into a topic using Groq."""
+    prompt = f"""Clasifica este articulo periodistico en UNA de estas categorias:
 POLITICA, JUDICIAL, ECONOMIA, SALUD, DESINFORMACION, PSEUDOCIENCIA, OTRO
 
-Responde SOLO la palabra.
+Responde SOLO con la palabra de la categoria, sin explicaciones.
 
-Titular: {title}"""
-    result = groq_invoke(prompt, max_tokens=8, temperature=0.0, model=GROQ_FAST_MODEL)
+Titular: {title}
+Contenido: {snippet[:200] if snippet else ""}"""
+    result = groq_invoke(prompt, max_tokens=10, temperature=0.0)
     result = result.strip().upper().split()[0] if result else "OTRO"
     return result if result in VALID_TOPICS else "OTRO"
 
-def _chunk(lst, n):
-    """Yield successive n-sized chunks."""
-    for i in range(0, len(lst), n):
-        yield lst[i:i + n]
-
-def _safe_json_loads(text):
-    """Extractor robusto de array JSON para respuestas de LLM (maneja unterminated strings y wrappers)."""
-    if not text or not isinstance(text, str):
-        return None
-    t = text.strip()
-    # Quitar fences de markdown
-    t = re.sub(r'^```(?:json)?\s*', '', t, flags=re.IGNORECASE | re.MULTILINE)
-    t = re.sub(r'\s*```$', '', t, flags=re.MULTILINE)
-    t = t.strip()
-    # Extraer el primer [ ... ] completo
-    start = t.find('[')
-    end = t.rfind(']')
-    if start != -1 and end != -1 and end > start:
-        candidate = t[start:end+1]
-    else:
-        candidate = t
-    try:
-        return json.loads(candidate)
-    except Exception:
-        # Segundo intento: colapsar whitespace
-        try:
-            candidate2 = re.sub(r'\s+', ' ', candidate)
-            return json.loads(candidate2)
-        except Exception as e2:
-            log.debug(f"JSON still failing: {str(e2)[:80]} | preview: {candidate[:150]}...")
-            return None
-
-def heuristic_classify(title, snippet="", source_name="", is_fc=False):
-    """Clasificación rápida por keywords (sin LLM). Muy agresiva en v8."""
-    text = f"{title or ''} {snippet or ''}".lower()
-    best_topic = "OTRO"
-    best_score = 0
-    for topic, kws in TOPIC_KEYWORDS.items():
-        sc = sum(1 for kw in kws if kw in text)
-        if sc > best_score:
-            best_score = sc
-            best_topic = topic
-    # Bias fuerte para fact-checkers
-    if is_fc:
-        if any(kw in text for kw in TOPIC_KEYWORDS.get("DESINFORMACION", [])[:8]):
-            best_topic = "DESINFORMACION"
-        elif any(kw in text for kw in TOPIC_KEYWORDS.get("PSEUDOCIENCIA", [])[:8]):
-            best_topic = "PSEUDOCIENCIA"
-    return best_topic if best_score >= 1 else None
-
-def translate_titles_batch(records):
-    """Traduce en batches PEQUEÑOS (max 4). Seguro contra 413 y parse errors."""
-    to_translate = [r for r in records if r.get("language") != "es" and not r.get("title_es")]
-    if not to_translate:
-        return 0
-
-    total_llm_calls = 0
-    for chunk in _chunk(to_translate, MAX_BATCH_SIZE_TRANSLATE):
-        if len(chunk) <= 1:
-            for r in chunk:
-                r["title_es"] = translate_to_spanish(r["title"])
-            total_llm_calls += 1
-            time.sleep(1.2)
-            continue
-
-        # Prompt compacto
-        lines = [f'{i}: {r.get("title","")[:95]}' for i, r in enumerate(chunk)]
-        prompt = (
-            "Traduce al español SOLO los siguientes titulares. "
-            "Responde EXCLUSIVAMENTE un JSON array válido, sin explicaciones ni markdown:\n"
-            "[{\"idx\":0,\"title_es\":\"...\"}, ...]\n\n" + "\n".join(lines)
-        )
-
-        resp = groq_invoke(prompt, max_tokens=280, temperature=0.0, model=GROQ_FAST_MODEL)
-        total_llm_calls += 1
-
-        if resp == "__PAYLOAD_TOO_LARGE__":
-            log.warning("413 en translate batch - fallback individual del chunk")
-            for r in chunk:
-                r["title_es"] = translate_to_spanish(r["title"])
-            time.sleep(2)
-            continue
-
-        parsed = _safe_json_loads(resp)
-        if parsed and isinstance(parsed, list):
-            mapping = {}
-            for x in parsed:
-                if isinstance(x, dict):
-                    try:
-                        idx = int(x.get("idx", -1))
-                        mapping[idx] = (x.get("title_es") or "").strip()
-                    except Exception:
-                        pass
-            for i, r in enumerate(chunk):
-                r["title_es"] = mapping.get(i) or r.get("title", "")
-        else:
-            log.warning("Batch translate parse failed, fallback individual")
-            for r in chunk:
-                r["title_es"] = translate_to_spanish(r["title"])
-
-        time.sleep(1.5)  # respiración para rate limit
-
-    return total_llm_calls
-
-def classify_topics_batch(records, use_heuristic=True):
-    """Clasifica en batches PEQUEÑOS (max 6). Heurística primero + robustez."""
-    if not records:
-        return 0
-
-    to_classify = []
-    heuristic_hits = 0
-    for r in records:
-        if r.get("topic") and r["topic"] != "":
-            continue
-        h = None
-        if use_heuristic:
-            h = heuristic_classify(
-                r.get("title_es") or r.get("title", ""),
-                r.get("content_snippet", ""),
-                r.get("source_name", ""),
-                r.get("is_factchecker", False)
-            )
-            if h:
-                r["topic"] = h
-                heuristic_hits += 1
-                continue
-        to_classify.append(r)
-
-    if not to_classify:
-        if heuristic_hits:
-            log.info(f"  Heuristic classified {heuristic_hits} (sin LLM)")
-        return 0
-
-    total_llm_calls = 0
-    for chunk in _chunk(to_classify, MAX_BATCH_SIZE_CLASSIFY):
-        if len(chunk) == 0:
-            continue
-        if len(chunk) == 1:
-            r = chunk[0]
-            r["topic"] = classify_topic(r.get("title_es") or r.get("title", ""), r.get("content_snippet", ""))
-            total_llm_calls += 1
-            time.sleep(1)
-            continue
-
-        lines = []
-        for i, r in enumerate(chunk):
-            ttl = (r.get("title_es") or r.get("title", ""))[:90]
-            lines.append(f'{i}: {ttl}')
-
-        prompt = (
-            "Clasifica cada artículo en EXACTAMENTE UNA de: " + ", ".join(VALID_TOPICS) + ".\n"
-            "Responde SOLO JSON array: [{\"idx\":0,\"topic\":\"POLITICA\"}, ...]. Nada más.\n\n"
-            + "\n".join(lines)
-        )
-
-        resp = groq_invoke(prompt, max_tokens=220, temperature=0.0, model=GROQ_FAST_MODEL)
-        total_llm_calls += 1
-
-        if resp == "__PAYLOAD_TOO_LARGE__":
-            log.warning("413 en classify batch - fallback individual del chunk")
-            for r in chunk:
-                r["topic"] = classify_topic(r.get("title_es") or r.get("title", ""), r.get("content_snippet", ""))
-            time.sleep(2)
-            continue
-
-        parsed = _safe_json_loads(resp)
-        if parsed and isinstance(parsed, list):
-            idx_map = {}
-            for x in parsed:
-                if isinstance(x, dict):
-                    try:
-                        idx = int(x.get("idx", -1))
-                        t = str(x.get("topic", "OTRO")).upper().strip()
-                        idx_map[idx] = t if t in VALID_TOPICS else "OTRO"
-                    except Exception:
-                        pass
-            for i, r in enumerate(chunk):
-                r["topic"] = idx_map.get(i, "OTRO")
-        else:
-            log.warning("Batch classify parse failed, fallback individual")
-            for r in chunk:
-                r["topic"] = classify_topic(r.get("title_es") or r.get("title", ""), r.get("content_snippet", ""))
-
-        time.sleep(1.5)
-
-    if heuristic_hits or total_llm_calls:
-        log.info(f"  Classify: {heuristic_hits} heuristic + ~{total_llm_calls} LLM calls (batches de <=6)")
-    return total_llm_calls
-
-print("Groq helpers v8 (batches pequeños + JSON robusto + 413 handling) OK")
+print("Groq helpers OK")
 
 # COMMAND ----------
-
 # Celda 5: Crear / migrar tablas Delta
 
 spark.sql(f"CREATE DATABASE IF NOT EXISTS {DB_RAW}")
@@ -416,17 +162,16 @@ for tbl, col, td in [
 print("Tables ready")
 
 # COMMAND ----------
-
 # Celda 6: Fuentes — medios + fact-checkers + pseudociencias/salud
 
 HEADERS_HTTP = {
-    "User-Agent":"Mozilla/5.0 (compatible; ARCAS-Research/8.0)",
+    "User-Agent":"Mozilla/5.0 (compatible; ARCAS-Research/6.0)",
     "Accept-Language":"es-ES,es;q=0.9,en;q=0.8",
 }
 
 MEDIA_SOURCES = [
     # Prensa generalista
-    ("El Pais", "https://feeds.elpais.com/mrss-s/pages/ep/site/elpais.com/section/espana/portada", "es", False),
+    ("El Pais",          "https://elpais.com/espana/",                "es", False),
     ("El Mundo",         "https://www.elmundo.es/espana.html",         "es", False),
     ("ABC",              "https://www.abc.es/espana/",                 "es", False),
     ("La Vanguardia",    "https://www.lavanguardia.com/politica",      "es", False),
@@ -442,10 +187,11 @@ MEDIA_SOURCES = [
     ("Expansion",        "https://www.expansion.com/economia.html",    "es", False),
     # Fuentes judiciales y transparencia
     ("Poder Judicial",   "https://www.poderjudicial.es/cgpj/es/Poder-Judicial/Noticias-Judiciales/", "es", False),
-    ("Transparencia", "https://www.transparencia.gob.es/transparencia/transparencia_Home/index.html", "es", False),
+    ("Transparencia",    "https://www.transparencia.gob.es/transparencia/transparencia_Home/index/Mas-informacion/noticias.html", "es", False),
     ("Civio",            "https://civio.es/noticias/",                 "es", False),
-    ("El Salto", "https://www.elsaltodiario.com/", "es", False),
+    ("El Salto",         "https://www.elsaltodiario.com/politica",     "es", False),
     # Salud y pseudociencias
+    ("El Pais Salud",    "https://elpais.com/salud-y-bienestar/",      "es", False),
     ("El Mundo Salud",   "https://www.elmundo.es/ciencia-y-salud/salud.html", "es", False),
     ("El Confidencial Salud","https://www.elconfidencial.com/bienestar/", "es", False),
     ("20minutos",        "https://www.20minutos.es/ciencia/",          "es", False),
@@ -453,15 +199,14 @@ MEDIA_SOURCES = [
     ("AP News Spain",    "https://apnews.com/hub/spain",               "en", False),
     ("Transparency Intl","https://www.transparency.org/en/news",       "en", False),
     # Fact-checkers generalistas
-    ("Maldita.es", "https://maldita.es/malditobulo/", "es", True),
+    ("Maldita.es",       "https://maldita.es/malditobulo/",            "es", True),
     ("Newtral",          "https://www.newtral.es/zona-verificacion/fact-check/", "es", True),
     ("EFE Verifica",     "https://verifica.efe.com/",                  "es", True),
-    ("RTVE Verifica",    "https://www.rtve.es/noticias/verificartve/", "es", True),
+    ("RTVE Verifica",    "https://www.rtve.es/noticias/verificacion/", "es", True),
     ("Snopes",           "https://www.snopes.com/fact-check/",         "en", True),
     ("PolitiFact",       "https://www.politifact.com/factchecks/",     "en", True),
     # Fact-checkers ciencia y salud
-    ("Maldita Ciencia", "https://maldita.es/malditaciencia/", "es", True),
-    ("APETP",           "https://www.apetp.com/lista-de-terapias-pseudocientificas/", "es", True)
+    ("Maldita Ciencia",  "https://maldita.es/malditaciencia/",         "es", True),
 ]
 
 def fetch_snippet(url, max_chars=1000):
@@ -506,7 +251,6 @@ def scrape_source(name, url, language, is_fc):
 print(f"Sources: {len(MEDIA_SOURCES)}")
 
 # COMMAND ----------
-
 # Celda 7: Ingesta BOE (solo contraste)
 
 def fetch_boe(pub_date):
@@ -546,31 +290,12 @@ for days_back in range(3):
 print(f"BOE (contraste): {len(boe_records)}")
 
 # COMMAND ----------
+# Celda 8: Ingesta medios
 
-# Celda 8: Ingesta medios (PARALELIZADA v8)
-
-def scrape_all_parallel(sources, max_workers=7):
-    """Ejecuta scrape_source en paralelo (I/O-bound)."""
-    results = []
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_to_src = {
-            executor.submit(scrape_source, name, url, lang, is_fc): name
-            for name, url, lang, is_fc in sources
-        }
-        for future in as_completed(future_to_src):
-            name = future_to_src[future]
-            try:
-                items = future.result()
-                results.extend(items)
-            except Exception as exc:
-                log.warning(f"Scrape {name} generated exception: {exc}")
-    return results
-
-t_scrape = time.time()
-media_records = scrape_all_parallel(MEDIA_SOURCES)
-print(f"Media (parallel): {len(media_records)} in {time.time()-t_scrape:.1f}s")
-
-# COMMAND ----------
+media_records = []
+for name, url, lang, is_fc in MEDIA_SOURCES:
+    media_records.extend(scrape_source(name, url, lang, is_fc))
+print(f"Media: {len(media_records)}")
 
 # COMMAND ----------
 # Celda 9: Guardar en Delta con dedup, traduccion y clasificacion de topic
@@ -578,92 +303,40 @@ print(f"Media (parallel): {len(media_records)} in {time.time()-t_scrape:.1f}s")
 from pyspark.sql import Row
 from pyspark.sql.functions import current_timestamp
 
-t9 = time.time()
 all_records = boe_records + media_records
+try:
+    existing = set(r.content_hash for r in spark.sql(
+        f"SELECT content_hash FROM {TBL_ARTICLES}").collect())
+except Exception: existing = set()
 
-new_records = []
-if all_records:
-    cand_rows = [Row(**r) for r in all_records]
-    cand_df = spark.createDataFrame(cand_rows)
-    existing_hashes = spark.table(TBL_ARTICLES).select("content_hash").distinct()
-    new_df = cand_df.join(existing_hashes, on="content_hash", how="left_anti")
-    new_records = [r.asDict() for r in new_df.collect()]
-
-print(f"New: {len(new_records)} (dedup via Spark)")
-
-# Columnas exactas de TBL_ARTICLES — nunca mas, nunca menos
-ARTICLE_COLS = [
-    "source_type", "source_name", "title", "title_es",
-    "content_url", "content_snippet", "pub_date", "language",
-    "jurisdiction", "content_hash", "is_factchecker", "topic"
-]
+new_records = [r for r in all_records if r["content_hash"] not in existing]
+print(f"New: {len(new_records)}")
 
 if new_records and GROQ_API_KEY:
-    # 1. Traduccion: solo titulos en ingles, solo con marcadores ausentes
-    t_tr = time.time()
+    # Traducir titulos en ingles
+    eng = [r for r in new_records if r["language"]!="es"]
+    for i,r in enumerate(eng):
+        r["title_es"] = translate_to_spanish(r["title"])
+        if (i+1)%10==0: time.sleep(3)
     for r in new_records:
-        if r.get("language") != "es" and not r.get("title_es"):
-            r["title_es"] = translate_to_spanish(r.get("title", ""))
-            time.sleep(0.5)
-        elif not r.get("title_es"):
-            r["title_es"] = r.get("title", "")
-    print(f"  Translations done in {time.time()-t_tr:.1f}s")
+        if r["language"]=="es" and not r["title_es"]: r["title_es"]=r["title"]
 
-    # 2. Clasificacion topic: 100% heuristica, sin LLM
-    # La heuristica cubre ~42% con keywords. El resto va a OTRO.
-    # Eliminamos completamente los 50 LLM calls que generaban 429.
-    t_cl = time.time()
-    heuristic_hits = 0
-    for r in new_records:
-        if r.get("source_type") == "gazette":
-            r["topic"] = "OFICIAL"
-            continue
-        if r.get("topic"):
-            continue
-        h = heuristic_classify(
-            r.get("title_es") or r.get("title", ""),
-            r.get("content_snippet", ""),
-            r.get("source_name", ""),
-            r.get("is_factchecker", False)
-        )
-        r["topic"] = h if h else "OTRO"
-        heuristic_hits += 1
-    print(f"  Topics: {heuristic_hits} heuristic (0 LLM calls) in {time.time()-t_cl:.1f}s")
+    # Clasificar topic (batch de 5 en 5 para no saturar Groq)
+    media_new = [r for r in new_records if r["source_type"]!="gazette"]
+    print(f"Classifying topics for {len(media_new)} media articles...")
+    for i, r in enumerate(media_new):
+        if not r.get("topic"):
+            r["topic"] = classify_topic(r.get("title_es") or r.get("title",""))
+        if (i+1)%5==0: time.sleep(2)
+    # BOE ya tiene topic=OFICIAL asignado
 
-# Limpiar y escribir en Delta
 if new_records:
-    clean = []
-    for r in new_records:
-        row = {k: r.get(k, "") for k in ARTICLE_COLS}
-        row["is_factchecker"] = bool(r.get("is_factchecker", False))
-        row["title_es"]        = row["title_es"] or row["title"]
-        row["topic"]           = row["topic"] or "OTRO"
-        row["content_snippet"] = row["content_snippet"] or ""
-        clean.append(row)
-
-    df_new = spark.createDataFrame([Row(**r) for r in clean])
-    df_new = df_new.withColumn("ingested_at", current_timestamp())
-    df_new.createOrReplaceTempView("new_enriched")
-    spark.sql(f"""
-        MERGE INTO {TBL_ARTICLES} t
-        USING new_enriched n
-        ON t.content_hash = n.content_hash
-        WHEN NOT MATCHED THEN INSERT (
-            source_type, source_name, title, title_es,
-            content_url, content_snippet, pub_date, language,
-            jurisdiction, content_hash, is_factchecker, topic, ingested_at
-        ) VALUES (
-            n.source_type, n.source_name, n.title, n.title_es,
-            n.content_url, n.content_snippet, n.pub_date, n.language,
-            n.jurisdiction, n.content_hash, n.is_factchecker, n.topic, n.ingested_at
-        )
-    """)
-    print(f"Merged {len(clean)} articles in {time.time()-t9:.1f}s total")
-else:
-    print("No new articles today.")
+    df = spark.createDataFrame([Row(**r) for r in new_records])
+    df = df.withColumn("ingested_at", current_timestamp())
+    df.write.format("delta").mode("append").saveAsTable(TBL_ARTICLES)
+    print(f"Saved {len(new_records)} articles")
 
 # COMMAND ----------
-
 # Celda 10: Scoring — SOLO medios/fact-checkers, ampliado con pseudociencias
 
 KW_A=["contrato","adjudicaci","licitaci","concurso","subvencion","obra publica",
@@ -732,8 +405,7 @@ for r,s in scored:
 print(f"Media candidates: {len(media_candidates)} | Above threshold: {len(above)}")
 
 # COMMAND ----------
-
-# Celda 11: Analisis profundo (PARALELIZADO v8)
+# Celda 11: Analisis profundo
 
 import uuid
 from datetime import datetime
@@ -785,8 +457,11 @@ ENTITY_PROMPT = """Extrae entidades del texto en JSON valido.
 SOLO JSON. Formato: {{"personas":[],"organismos":[],"casos":[],"partidos":[]}}
 Texto: {text}"""
 
-def _process_one_for_alert(record, scores):
-    """Procesa un candidato: deep analysis + entities."""
+alerts_to_save   = []
+entities_to_save = []
+limit = min(len(above), 15)
+
+for record, scores in above[:limit]:
     cat       = top_cat(scores)
     base_conf = max(scores.values())
     title_es  = record.get("title_es") or record.get("title","")
@@ -797,7 +472,7 @@ def _process_one_for_alert(record, scores):
 
     snippet = record.get("content_snippet","")
     if not snippet and record.get("content_url"):
-        snippet = fetch_snippet(record["content_url"])
+        snippet = fetch_snippet(record["content_url"]); time.sleep(1)
 
     analysis = groq_invoke(DEEP_PROMPT.format(
         title=title_es, source=source, cred_pct=cred_pct,
@@ -814,17 +489,16 @@ def _process_one_for_alert(record, scores):
     conf = round(max(0.10, min(conf*cred, 0.99)), 3)
 
     alert_id = str(uuid.uuid4())
-    alert = {
+    alerts_to_save.append({
         "alert_id":alert_id,"category":cat,"topic":topic,"status":"pending",
         "confidence_score":conf,"nl_justification":analysis,"deep_analysis":analysis,
         "source_name":source,"title":title_es,"content_url":record["content_url"],
-        "created_at": datetime.now(timezone.utc).isoformat(),
-    }
+        "created_at":datetime.utcnow().isoformat(),
+    })
     log.info(f"  [{cat}/{topic} {conf:.2f} {cred_pct}%] {title_es[:55]}")
 
-    entities = []
     ej = groq_invoke(ENTITY_PROMPT.format(text=f"{title_es}. {snippet[:300]}"),
-                     max_tokens=200, temperature=0.0, model=GROQ_FAST_MODEL)
+                     max_tokens=200, temperature=0.0)
     try:
         clean = re.sub(r"```json|```","",ej).strip()
         ents = json.loads(clean)
@@ -833,37 +507,17 @@ def _process_one_for_alert(record, scores):
             for name in (names or []):
                 if len(str(name))<3: continue
                 eid = hashlib.sha256(f"{etype}|{name}".encode()).hexdigest()[:16]
-                entities.append({
+                entities_to_save.append({
                     "entity_id":eid,"entity_type":etype,"entity_name":str(name),
                     "first_seen":today_str,"last_seen":today_str,"mention_count":1,
                     "sources":source,"alert_ids":alert_id,
                 })
-    except Exception:
-        pass
+    except Exception: pass
+    time.sleep(2)
 
-    time.sleep(5)
-    return alert, entities
-
-alerts_to_save   = []
-entities_to_save = []
-limit = min(len(above), 15)
-
-t11 = time.time()
-log.info("Esperando 20s para recuperar cuota Groq tras celda 9...")
-time.sleep(20)
-
-for record, scores in above[:limit]:
-    try:
-        al, ents = _process_one_for_alert(record, scores)
-        alerts_to_save.append(al)
-        entities_to_save.extend(ents)
-    except Exception as e:
-        log.warning(f"Alert processing error: {e}")
-
-print(f"Alerts: {len(alerts_to_save)} | Entities: {len(entities_to_save)} | Time: {time.time()-t11:.1f}s")
+print(f"Alerts: {len(alerts_to_save)} | Entities: {len(entities_to_save)}")
 
 # COMMAND ----------
-
 # Celda 12: Guardar alertas y entidades en Delta
 
 if alerts_to_save:
@@ -883,7 +537,6 @@ if entities_to_save:
     print(f"Saved {len(entities_to_save)} entities")
 
 # COMMAND ----------
-
 # Celda 13: Neo4j
 
 if NEO4J_URI and entities_to_save:
@@ -915,7 +568,6 @@ if NEO4J_URI and entities_to_save:
         log.warning(f"Neo4j failed: {ex}")
 
 # COMMAND ----------
-
 # Celda 14: Resumen
 
 ta   = spark.sql(f"SELECT count(*) AS n FROM {TBL_ARTICLES}").collect()[0]["n"]
@@ -924,11 +576,47 @@ tal  = spark.sql(f"SELECT count(*) AS n FROM {TBL_ALERTS}").collect()[0]["n"]
 pen  = spark.sql(f"SELECT count(*) AS n FROM {TBL_ALERTS} WHERE status='pending'").collect()[0]["n"]
 te   = spark.sql(f"SELECT count(*) AS n FROM {TBL_ENTITIES}").collect()[0]["n"]
 
-print(f"\n=== ARCAS Daily Run v8 (batch seguro + robusto) ===")
+# COMMAND ----------
+# Celda 15: Optimizacion on-demand (solo si RUN_OPTIMIZE=true)
+
+if RUN_OPTIMIZE:
+    log.info("Ejecutando optimizacion de tablas Delta...")
+    for tbl, zorder in [
+        (TBL_ALERTS,    "status, created_at, confidence_score"),
+        (TBL_ARTICLES,  "source_type, ingested_at, topic"),
+        (TBL_ENTITIES,  "entity_type, last_seen"),
+    ]:
+        try:
+            spark.sql(f"OPTIMIZE {tbl} ZORDER BY ({zorder})")
+            log.info(f"  OPTIMIZE OK: {tbl}")
+        except Exception as e:
+            log.warning(f"  OPTIMIZE failed {tbl}: {e}")
+
+    for tbl in [TBL_ALERTS, TBL_ARTICLES, TBL_ENTITIES]:
+        try:
+            spark.sql(f"VACUUM {tbl} RETAIN 168 HOURS")
+            log.info(f"  VACUUM OK: {tbl}")
+        except Exception as e:
+            log.warning(f"  VACUUM failed {tbl}: {e}")
+
+    for tbl in [TBL_ALERTS, TBL_ARTICLES]:
+        try:
+            spark.sql(f"ANALYZE TABLE {tbl} COMPUTE STATISTICS FOR ALL COLUMNS")
+            log.info(f"  ANALYZE OK: {tbl}")
+        except Exception as e:
+            log.warning(f"  ANALYZE failed {tbl}: {e}")
+
+    print("Optimizacion completada")
+else:
+    print("Optimizacion omitida (RUN_OPTIMIZE=false)")
+
+# COMMAND ----------
+# Celda 16: Resumen
+
+print(f"\n=== ARCAS Daily Run v6 ===")
 print(f"Articulos medios:    {tm}")
 print(f"Articulos totales:   {ta} (incl. BOE contraste)")
 print(f"Alertas totales:     {tal}")
 print(f"Pendientes:          {pen}")
 print(f"Entidades grafo:     {te}")
-print("====================================================")
-print("Notas v8: batches max 4-6 + JSON robusto + manejo 413 + heurística fuerte.")
+print("==========================")
