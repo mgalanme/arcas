@@ -703,6 +703,62 @@ elif page=="✍️ Generar publicaciones":
         char_limits={"Facebook / LinkedIn":3000,"X (Twitter)":280,"Instagram":2200}
         char_limit=char_limits[platform]
 
+        st.markdown('<div class="section-rule-light">Instrucciones al redactor</div>',unsafe_allow_html=True)
+        DEFAULT_PROMPT="""Eres un periodista de investigación riguroso y políticamente neutral.
+Informa sobre hechos concretos de la noticia analizada, no generalidades.
+Nunca acuses directamente — señala patrones y hechos verificables.
+Usa lenguaje accesible, sin jerga técnica ni legal.
+Indica explícitamente si hay pruebas o si la información se basa en declaraciones sin respaldo.
+Invita a la ciudadanía a investigar y verificar por su cuenta.
+
+El texto usará un estilo socrático. Tendrá un máximo de 5 párrafos.
+Cada párrafo irá introducido con una pregunta en MAYÚSCULAS precedida de un emoji, en modo socrático.
+Usaremos hashtags durante el texto, con un máximo de 15.
+Puedes ir a la fuente para enriquecer la noticia con detalles adicionales.
+Cada párrafo contendrá 5 ó 6 frases, explicando con detalle y animando a leer el siguiente.
+Usa un lenguaje sencillo, entendible por todo el mundo."""
+        master=st.text_area("instrucciones",value=DEFAULT_PROMPT,height=200,label_visibility="collapsed")
+
+        if st.button("✍️ Redactar publicación",use_container_width=True):
+            cat=sel["category"]; cat_name=CAT_INFO.get(cat,(cat,""))[0]
+            justif=str(sel["nl_justification"]); title=str(sel["title"])
+            source=str(sel["source_name"]); conf=float(sel["confidence_score"])
+            url=str(sel.get("content_url",""))
+            full_prompt=f"""INSTRUCCIONES DEL OPERADOR:
+{master}
+
+---
+NOTICIA ANALIZADA:
+- Tipo de irregularidad: {cat_name}
+- Fuente: {source}
+- Titular: {title}
+- URL original: {url}
+- Análisis del sistema: {justif[:600]}
+- Nivel de certeza: {conf:.0%}
+
+---
+REQUISITOS TÉCNICOS:
+- Idioma: {lang_name}
+- Red social: {platform} (máximo {char_limit} caracteres)
+- Tono: {tone}
+- Formato: Markdown con **negrita**, *cursiva* y #hashtags integrados en el texto
+- NO menciones IA ni sistemas automatizados
+- Céntrate en ESTA noticia específica, no en generalidades
+
+Escribe únicamente el texto de la publicación en Markdown."""
+            with st.spinner("Redactando..."):
+                post_md=groq_gen(full_prompt)
+            st.markdown('<div class="section-rule-light">Texto Markdown (raw)</div>',unsafe_allow_html=True)
+            st.code(post_md,language="markdown")
+            st.markdown('<div class="section-rule-light">Vista previa renderizada</div>',unsafe_allow_html=True)
+            st.markdown(post_md)
+            char_count=len(post_md)
+            color="#1a7a4a" if char_count<=char_limit else "#c0392b"
+            st.markdown(f'<span style="font-family:JetBrains Mono,monospace;font-size:0.68rem;color:{color};">{char_count}/{char_limit} caracteres</span>',unsafe_allow_html=True)
+            c1,c2=st.columns(2)
+            with c1: st.download_button("⬇️ .md",post_md,f"arcas_{lang_name}_{cat}.md","text/markdown")
+            with c2: st.download_button("⬇️ .txt",post_md,f"arcas_{lang_name}_{cat}.txt","text/plain")
+
 # ══ MANTENIMIENTO ════════════════════════════════════════════════════════════
 elif page=="🔧 Mantenimiento":
     st.markdown('<div class="section-rule">Mantenimiento del sistema</div>', unsafe_allow_html=True)

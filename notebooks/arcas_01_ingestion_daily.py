@@ -171,7 +171,7 @@ HEADERS_HTTP = {
 
 MEDIA_SOURCES = [
     # Prensa generalista
-    ("El Pais",          "https://elpais.com/espana/",                "es", False),
+    ("El Pais",          "https://elpais.com/noticias/espana/",                "es", False),
     ("El Mundo",         "https://www.elmundo.es/espana.html",         "es", False),
     ("ABC",              "https://www.abc.es/espana/",                 "es", False),
     ("La Vanguardia",    "https://www.lavanguardia.com/politica",      "es", False),
@@ -187,11 +187,11 @@ MEDIA_SOURCES = [
     ("Expansion",        "https://www.expansion.com/economia.html",    "es", False),
     # Fuentes judiciales y transparencia
     ("Poder Judicial",   "https://www.poderjudicial.es/cgpj/es/Poder-Judicial/Noticias-Judiciales/", "es", False),
-    ("Transparencia",    "https://www.transparencia.gob.es/transparencia/transparencia_Home/index/Mas-informacion/noticias.html", "es", False),
+    ("Transparencia",    "https://www.transparencia.gob.es/transparencia/transparencia_Home/index.html", "es", False),
     ("Civio",            "https://civio.es/noticias/",                 "es", False),
-    ("El Salto",         "https://www.elsaltodiario.com/politica",     "es", False),
+    ("El Salto",         "https://www.elsaltodiario.com/el-rumor-de-las-multitudes",     "es", False),
     # Salud y pseudociencias
-    ("El Pais Salud",    "https://elpais.com/salud-y-bienestar/",      "es", False),
+    ("El Pais Salud",    "https://elpais.com/noticias/salud/",      "es", False),
     ("El Mundo Salud",   "https://www.elmundo.es/ciencia-y-salud/salud.html", "es", False),
     ("El Confidencial Salud","https://www.elconfidencial.com/bienestar/", "es", False),
     ("20minutos",        "https://www.20minutos.es/ciencia/",          "es", False),
@@ -199,14 +199,15 @@ MEDIA_SOURCES = [
     ("AP News Spain",    "https://apnews.com/hub/spain",               "en", False),
     ("Transparency Intl","https://www.transparency.org/en/news",       "en", False),
     # Fact-checkers generalistas
-    ("Maldita.es",       "https://maldita.es/malditobulo/",            "es", True),
+    ("Maldita.es",       "https://maldita.es/malditabulo/",            "es", True),
     ("Newtral",          "https://www.newtral.es/zona-verificacion/fact-check/", "es", True),
     ("EFE Verifica",     "https://verifica.efe.com/",                  "es", True),
-    ("RTVE Verifica",    "https://www.rtve.es/noticias/verificacion/", "es", True),
+    ("RTVE Verifica",    "https://www.rtve.es/noticias/bulos/", "es", True),
     ("Snopes",           "https://www.snopes.com/fact-check/",         "en", True),
     ("PolitiFact",       "https://www.politifact.com/factchecks/",     "en", True),
     # Fact-checkers ciencia y salud
-    ("Maldita Ciencia",  "https://maldita.es/malditaciencia/",         "es", True),
+    ("APETP",           "https://www.apetp.com/index.php/noticias/",      "es", True),
+    ("Maldita Ciencia",  "https://maldita.es/malditaciencia/bulos/",         "es", True),
 ]
 
 def fetch_snippet(url, max_chars=1000):
